@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Duket — Inventory & POS  (single-file vanilla JS PWA)
+   My Shop — Inventory & POS  (single-file vanilla JS PWA)
    All data lives in IndexedDB via Dexie. localStorage is used ONLY for the
    dark-mode preference. No frameworks, no build step — open index.html or
    serve the folder as-is.
@@ -307,7 +307,7 @@
     const app = qs('#app');
     app.innerHTML = `
       <header class="topbar">
-        <div class="brand"><span class="dot"></span>Duket <span class="offline-pill">OFFLINE</span></div>
+        <div class="brand"><span class="dot"></span>My Shop <span class="offline-pill">OFFLINE</span></div>
         <div class="actions">
           <button class="iconbtn" id="theme-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">${S.theme === 'dark' ? '☀️' : '🌙'}</button>
         </div>
@@ -1151,7 +1151,7 @@
   function printReceipt({ saleId, items, subtotal, discount, total, account, payerRef, customerName }) {
     const s = S.settings;
     const html = `
-      <h2>${escapeHtml(s.name || 'Duket Shop')}</h2>
+      <h2>${escapeHtml(s.name || 'My Shop')}</h2>
       <div class="center">${escapeHtml(s.address || '')}</div>
       <div class="center">${s.phone ? 'Tel: ' + escapeHtml(s.phone) : ''}</div>
       <div class="center">${s.tin ? 'TIN: ' + escapeHtml(s.tin) : ''}</div>
@@ -1381,7 +1381,7 @@
           <div class="btn-row"><button class="btn ${S.theme === 'light' ? 'primary' : 'ghost'} sm" data-theme-opt="light">☀️ Light</button>
             <button class="btn ${S.theme === 'dark' ? 'primary' : 'ghost'} sm" data-theme-opt="dark">🌙 Dark</button></div>
         </div>
-        <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">Duket v1.0 · All data stored on this device</p>`;
+        <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">My Shop v1.0 · All data stored on this device</p>`;
     },
     mount(el) {
       qs('#shop-form', el).addEventListener('submit', async (e) => {
@@ -1533,7 +1533,7 @@
     app.innerHTML = `
       <div class="onboarding">
         <div class="ic">🏪</div>
-        <h1>Welcome to Duket</h1>
+        <h1>Welcome to My Shop</h1>
         <p>Your offline inventory &amp; point-of-sale manager. Let's set up your shop — this only takes a moment, and everything stays on this device.</p>
         <form id="onboard-form" style="text-align:left">
           <div class="field"><label>Shop name</label><input name="name" required placeholder="e.g. Selam Mobile Accessories"></div>
@@ -1579,7 +1579,7 @@
     const root = document.getElementById('app') || document.body;
     root.innerHTML = `
       <div class="onboard">
-        <h1>Duket</h1>
+        <h1>My Shop</h1>
         <p>${mode === 'signIn' ? 'Sign in to your shop' : 'Create your shop account'}</p>
         <form id="auth-form">
           <div class="field"><label>Email</label><input name="email" type="email" required></div>
