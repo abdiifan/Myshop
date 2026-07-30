@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Duket — sw.js
+   My Shop — sw.js
    Cache-first app shell so the POS keeps working with no connection.
    Bump CACHE_VERSION whenever any precached file changes — this forces
    old clients to fetch the new files instead of serving stale ones.
