@@ -1,6 +1,6 @@
 {
-  "name": "Duket — Inventory & POS",
-  "short_name": "Duket",
+  "name": "My Shop — Inventory & POS",
+  "short_name": "My Shop",
   "description": "Offline-first inventory and point-of-sale manager for small shops.",
   "start_url": "./index.html",
   "scope": "./",
