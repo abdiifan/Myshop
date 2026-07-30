@@ -130,6 +130,41 @@
     accounts: '++id, label, type',
     settings: '&key'
   });
+  // v2: adds `uuid` (shared with the Supabase row id), `synced` (0/1 dirty
+  // flag) and `deleted` (soft-delete flag) to every table that syncs to
+  // Supabase. See supabase-client.js / sync.js.
+  db.version(2).stores({
+    products: '++id, &sku, name, brand, category, barcode, quantity, uuid, synced, deleted',
+    sales: '++id, date, paymentAccountId, customerId, uuid, synced',
+    saleItems: '++id, saleId, productId, uuid, synced',
+    purchases: '++id, date, supplierId, productId, uuid, synced',
+    suppliers: '++id, name, uuid, synced, deleted',
+    customers: '++id, name, phone, uuid, synced, deleted',
+    stockMovements: '++id, date, productId, type, uuid, synced',
+    accounts: '++id, label, type, uuid, synced, deleted',
+    settings: '&key'
+  }).upgrade(async (tx) => {
+    // Backfill uuid/synced on rows created before sync existed.
+    for (const name of ['products', 'sales', 'saleItems', 'purchases', 'suppliers', 'customers', 'stockMovements', 'accounts']) {
+      await tx.table(name).toCollection().modify((row) => {
+        if (!row.uuid) row.uuid = crypto.randomUUID();
+        if (row.synced == null) row.synced = 0;
+      });
+    }
+  });
+
+  // Auto-tag every locally created/edited row so the sync loop knows what's
+  // dirty, without touching any of the existing db.TABLE.add()/.update()
+  // call sites elsewhere in this file.
+  for (const name of ['products', 'sales', 'saleItems', 'purchases', 'suppliers', 'customers', 'stockMovements', 'accounts']) {
+    db[name].hook('creating', (primKey, obj) => {
+      if (!obj.uuid) obj.uuid = crypto.randomUUID();
+      obj.synced = 0;
+    });
+    db[name].hook('updating', (mods) => {
+      if (mods.synced === undefined) return { synced: 0 };
+    });
+  }
 
   /* ---------------------------------------------------------------------
      Global state
@@ -181,16 +216,16 @@
       ]);
     }
     S.settings = shop;
-    S.accounts = await db.accounts.toArray();
+    S.accounts = (await db.accounts.toArray()).filter((a) => !a.deleted);
   }
 
-  async function refreshAccounts() { S.accounts = await db.accounts.toArray(); }
+  async function refreshAccounts() { S.accounts = (await db.accounts.toArray()).filter((a) => !a.deleted); }
 
   /* ---------------------------------------------------------------------
      Product index cache (name/sku/brand/barcode search + virtual list)
      --------------------------------------------------------------------- */
   async function rebuildProductIndex() {
-    S.productIndex = await db.products.toArray();
+    S.productIndex = (await db.products.toArray()).filter((p) => !p.deleted);
   }
 
   function searchProducts(query, category) {
@@ -720,7 +755,7 @@
         qs('#product-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete product?', `This removes "${p.name}" permanently. Sales history referencing it is kept.`, 'Delete');
           if (!ok) return;
-          await db.products.delete(p.id);
+          await db.products.update(p.id, { deleted: 1 });
           await rebuildProductIndex();
           closeModal();
           renderProductsBody();
@@ -849,7 +884,7 @@
   /* ----- Suppliers / Customers ----- */
   async function renderPeopleTab(body, kind) {
     const table = kind === 'suppliers' ? db.suppliers : db.customers;
-    const list = await table.toArray();
+    const list = (await table.toArray()).filter((x) => !x.deleted);
     body.innerHTML = `
       <div class="btn-row" style="margin-bottom:10px"><button class="btn primary sm" id="add-person">+ Add ${kind === 'suppliers' ? 'Supplier' : 'Customer'}</button></div>
       <div id="people-list"></div>`;
@@ -911,7 +946,7 @@
         qs('#person-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete?', `Remove "${p.name}" from your ${isSupplier ? 'suppliers' : 'customers'} list.`, 'Delete');
           if (!ok) return;
-          await (isSupplier ? db.suppliers : db.customers).delete(p.id);
+          await (isSupplier ? db.suppliers : db.customers).update(p.id, { deleted: 1 });
           closeModal(); renderProductsBody();
         };
       }
@@ -1423,7 +1458,7 @@
         qs('#account-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete account?', `Remove "${a.label}" from payment options.`, 'Delete');
           if (!ok) return;
-          await db.accounts.delete(a.id);
+          await db.accounts.update(a.id, { deleted: 1 });
           await refreshAccounts();
           closeModal();
           showView('settings');
@@ -1528,7 +1563,55 @@
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch((err) => console.warn('SW registration failed', err));
     }
+    // Kick off background sync now that the app is usable. Safe to call
+    // even if the device is offline or Supabase isn't configured yet —
+    // sync.js no-ops in that case.
+    if (window.DuketSync) window.DuketSync.startAutoSync();
   }
 
-  boot();
+  /* ---------------------------------------------------------------------
+     Auth gate — shown before boot() if Supabase auth is configured and no
+     session exists yet. If supabase-client.js wasn't loaded (e.g. you
+     haven't wired Supabase in yet), this falls straight through to boot()
+     so the app keeps working exactly as before, offline-only.
+     --------------------------------------------------------------------- */
+  function renderLoginScreen(mode = 'signIn') {
+    const root = document.getElementById('app') || document.body;
+    root.innerHTML = `
+      <div class="onboard">
+        <h1>Duket</h1>
+        <p>${mode === 'signIn' ? 'Sign in to your shop' : 'Create your shop account'}</p>
+        <form id="auth-form">
+          <div class="field"><label>Email</label><input name="email" type="email" required></div>
+          <div class="field"><label>Password</label><input name="password" type="password" minlength="6" required></div>
+          <button class="btn primary block" type="submit">${mode === 'signIn' ? 'Sign in' : 'Sign up'}</button>
+        </form>
+        <button class="btn ghost block" id="auth-switch">${mode === 'signIn' ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}</button>
+        <div id="auth-error" style="color:var(--danger);margin-top:8px"></div>
+      </div>`;
+    qs('#auth-switch').addEventListener('click', () => renderLoginScreen(mode === 'signIn' ? 'signUp' : 'signIn'));
+    qs('#auth-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const email = fd.get('email').trim();
+      const password = fd.get('password');
+      const errEl = qs('#auth-error');
+      errEl.textContent = '';
+      const { error } = mode === 'signIn'
+        ? await window.DuketAuth.signIn(email, password)
+        : await window.DuketAuth.signUp(email, password);
+      if (error) { errEl.textContent = error.message; return; }
+      if (mode === 'signUp') { errEl.style.color = 'var(--success)'; errEl.textContent = 'Account created — check your email if confirmation is required, then sign in.'; return; }
+      boot();
+    });
+  }
+
+  async function startApp() {
+    if (!window.DuketAuth) { boot(); return; } // Supabase not wired in yet
+    const session = await window.DuketAuth.getSession();
+    if (session) { boot(); return; }
+    renderLoginScreen('signIn');
+  }
+
+  startApp();
 })();
