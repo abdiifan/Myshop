@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <title>Duket — Inventory &amp; POS</title>
+  <meta name="description" content="Offline-first inventory and point-of-sale manager for small shops.">
+
+  <!-- PWA -->
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#0F6D57">
+  <link rel="icon" href="./icons/icon-192.png">
+  <link rel="apple-touch-icon" href="./icons/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Duket">
+
+  <!-- Avoid theme flash: set data-theme before first paint -->
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('duket:theme') || 'light';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    })();
+  </script>
+
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="app">
+    <div class="empty" style="padding-top:40vh">
+      <div class="ic" style="font-size:32px">🏪</div>
+      <p>Loading Duket…</p>
+    </div>
+  </div>
+  <div id="toasts"></div>
+  <div id="receipt-print"></div>
+
+  <!-- Dexie is vendored locally (not CDN) so the app boots fully offline
+       after the first load, and the service worker can cache it. -->
+  <script src="./dexie.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
