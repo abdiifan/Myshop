@@ -220,7 +220,23 @@ async function pullTable(cfg, shopId) {
 // ---------------------------------------------------------------------
 async function syncShopSettings(shopId) {
   const local = await db.settings.get('shop');
-  if (!local) return;
+
+  // Brand-new device: no local settings row exists at all yet. Pull
+  // whatever's on the server if it's already onboarded, instead of
+  // silently doing nothing and letting ensureDefaults() create blank
+  // local defaults that mask the real shop data.
+  if (!local) {
+    const { data: remote } = await supabase.from('shops').select('*').eq('id', shopId).single();
+    if (remote && remote.onboarded) {
+      await db.settings.put({
+        key: 'shop', name: remote.name, address: remote.address, phone: remote.phone,
+        tin: remote.tin, lowStockDefault: remote.low_stock_default,
+        allowNegativeStock: remote.allow_negative_stock, receiptHeader: remote.receipt_header,
+        receiptFooter: remote.receipt_footer, onboarded: remote.onboarded
+      });
+    }
+    return;
+  }
 
   // First time this device has seen this shop (fresh install/new device,
   // hasn't been through onboarding here yet) — pull whatever's already on
