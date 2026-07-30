@@ -1619,7 +1619,7 @@
         : await window.DuketAuth.signUp(email, password);
       if (error) { errEl.textContent = error.message; return; }
       if (mode === 'signUp') { errEl.style.color = 'var(--success)'; errEl.textContent = 'Account created — check your email if confirmation is required, then sign in.'; return; }
-      boot();
+      startApp();
     });
   }
 
@@ -1638,8 +1638,19 @@
       return;
     }
     const session = await window.DuketAuth.getSession();
-    if (session) { boot(); return; }
-    renderLoginScreen('signIn');
+    if (!session) { renderLoginScreen('signIn'); return; }
+
+    // Pull this shop's existing data down BEFORE ensureDefaults()/boot()
+    // decide what to render — otherwise a fresh/second device sees its own
+    // blank local defaults and shows onboarding instead of the real shop
+    // data that already exists on the server.
+    if (window.DuketSync) {
+      const root = document.getElementById('app') || document.body;
+      root.innerHTML = `<div class="empty" style="padding-top:40vh"><div class="ic" style="font-size:32px">🏪</div><p>Loading your shop…</p></div>`;
+      await window.DuketSync.syncNow();
+      window.DuketSync.startAutoSync();
+    }
+    boot();
   }
 
   // If the session is ever cleared — user signs out, token revoked/expired,
