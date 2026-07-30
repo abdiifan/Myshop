@@ -40,6 +40,11 @@
   <!-- Dexie is vendored locally (not CDN) so the app boots fully offline
        after the first load, and the service worker can cache it. -->
   <script src="./dexie.min.js"></script>
-  <script src="./app.js"></script>
+  <script type="module" src="./supabase-client.js"></script>
+  <script type="module" src="./sync.js"></script>
+  <!-- defer (not a plain classic script) so it runs after the two module
+       scripts above, which are always deferred — otherwise app.js could run
+       before window.DuketAuth / window.DuketSync exist. -->
+  <script src="./app.js" defer></script>
 </body>
 </html>
