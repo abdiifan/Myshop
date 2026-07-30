@@ -1381,6 +1381,12 @@
           <div class="btn-row"><button class="btn ${S.theme === 'light' ? 'primary' : 'ghost'} sm" data-theme-opt="light">☀️ Light</button>
             <button class="btn ${S.theme === 'dark' ? 'primary' : 'ghost'} sm" data-theme-opt="dark">🌙 Dark</button></div>
         </div>
+
+        ${window.DuketAuth ? `
+        <div class="section-title">Account</div>
+        <div class="card">
+          <button class="btn ghost block" id="sign-out">Sign out</button>
+        </div>` : ''}
         <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">My Shop v1.0 · All data stored on this device</p>`;
     },
     mount(el) {
@@ -1404,6 +1410,17 @@
         if (b.dataset.themeOpt !== S.theme) toggleTheme();
         showView('settings');
       }));
+      if (window.DuketAuth) {
+        qs('#sign-out', el).addEventListener('click', async () => {
+          const ok = await confirmDialog('Sign out?', 'Any unsynced changes will finish uploading first if you\'re online.', 'Sign out');
+          if (!ok) return;
+          if (window.DuketSync) await window.DuketSync.syncNow();
+          await window.DuketAuth.signOut();
+          // renderLoginScreen is also triggered by the onAuthChange('SIGNED_OUT')
+          // listener, but call it directly here too for an instant response.
+          renderLoginScreen('signIn');
+        });
+      }
     }
   };
 
@@ -1607,10 +1624,31 @@
   }
 
   async function startApp() {
-    if (!window.DuketAuth) { boot(); return; } // Supabase not wired in yet
+    if (!window.DuketAuth) {
+      // Supabase script failed to load/execute — do NOT let anyone into the
+      // app in this state. Show an explicit error instead of silently
+      // booting into local data.
+      const root = document.getElementById('app') || document.body;
+      root.innerHTML = `
+        <div class="onboard">
+          <h1>My Shop</h1>
+          <p style="color:var(--danger)">Couldn't reach the sign-in service. Check your connection and reload.</p>
+          <button class="btn primary block" onclick="location.reload()">Retry</button>
+        </div>`;
+      return;
+    }
     const session = await window.DuketAuth.getSession();
     if (session) { boot(); return; }
     renderLoginScreen('signIn');
+  }
+
+  // If the session is ever cleared — user signs out, token revoked/expired,
+  // or they sign out in another tab — immediately drop back to the login
+  // screen instead of leaving whatever was on screen visible/usable.
+  if (window.DuketAuth) {
+    window.DuketAuth.onAuthChange((event) => {
+      if (event === 'SIGNED_OUT') renderLoginScreen('signIn');
+    });
   }
 
   startApp();
