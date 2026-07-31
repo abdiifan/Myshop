@@ -185,6 +185,12 @@
     peopleTab: 'suppliers',    // 'suppliers' | 'customers'
     reportsRange: { from: daysAgo(6), to: startOfDay(new Date()) },
     chartLoaded: false,
+    reportsSubTab: 'inventory', // 'inventory' | 'sales' | 'profitability'
+    invFilter: { category: 'All', model: 'All', supplier: 'All', status: 'All' },
+    salesPeriod: 'daily',       // 'daily' | 'weekly' | 'monthly'
+    salesDay: startOfDay(new Date()),
+    salesWeekAnchor: startOfDay(new Date()),
+    salesMonth: new Date().toISOString().slice(0, 7), // 'YYYY-MM'
   };
 
   document.documentElement.setAttribute('data-theme', S.theme);
