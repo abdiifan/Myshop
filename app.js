@@ -226,6 +226,37 @@
      --------------------------------------------------------------------- */
   async function rebuildProductIndex() {
     S.productIndex = (await db.products.toArray()).filter((p) => !p.deleted);
+    await rebuildMovementMap();
+  }
+
+  /* ---------------------------------------------------------------------
+     Movement status ("Fast-Moving" / "Slow-Moving" / "Dead Stock" / "New")
+     Computed from stockMovements 'sale' rows — not user-entered.
+       Fast-Moving: last sale within 7 days
+       Slow-Moving: last sale within 30 days
+       Dead Stock:  no sale in 30+ days (and not a brand-new product)
+       New:         added < 30 days ago with no sales yet
+     --------------------------------------------------------------------- */
+  async function rebuildMovementMap() {
+    const lastSale = {};
+    const movements = await db.stockMovements.where('type').equals('sale').toArray();
+    for (const m of movements) {
+      if (!lastSale[m.productId] || m.date > lastSale[m.productId]) lastSale[m.productId] = m.date;
+    }
+    S.movementMap = lastSale;
+  }
+
+  function movementStatusFor(p) {
+    const last = S.movementMap ? S.movementMap[p.id] : null;
+    const DAY = 86400000;
+    if (!last) {
+      const age = Date.now() - (p.createdAt || 0);
+      return age < 30 * DAY ? 'New' : 'Dead Stock';
+    }
+    const days = (Date.now() - last) / DAY;
+    if (days <= 7) return 'Fast-Moving';
+    if (days <= 30) return 'Slow-Moving';
+    return 'Dead Stock';
   }
 
   function searchProducts(query, category) {
@@ -600,7 +631,7 @@
           <div class="emoji">${emojiFor(p.category)}</div>
           <div class="info">
             <div class="name">${escapeHtml(p.name)}</div>
-            <div class="meta">${escapeHtml(p.sku)} · ${escapeHtml(p.brand || '')}</div>
+            <div class="meta">${escapeHtml(p.sku)} · ${movementStatusFor(p)}</div>
           </div>
           <div class="price">
             <div class="sell num">Br ${fmtMoney(p.sellingPrice)}</div>
@@ -672,35 +703,31 @@
   function openProductModal(product) {
     const isEdit = !!product;
     const p = product || { category: 'Phone' };
+    const margin = (p.sellingPrice || 0) - (p.costPrice || 0);
     openModal(`
       <div class="modal-head"><h3>${isEdit ? 'Edit product' : 'Add product'}</h3><button class="modal-close" data-close>✕</button></div>
       <form id="product-form">
-        <div class="field"><label>Name (English/Amharic)</label><input name="name" required value="${escapeHtml(p.name || '')}" placeholder="e.g. Fast Charger 20W / ፈጣን ቻርጀር"></div>
-        <div class="field-row">
-          <div class="field"><label>Brand</label><input name="brand" value="${escapeHtml(p.brand || '')}"></div>
-          <div class="field"><label>Category</label>
-            <select name="category">${PRODUCT_CATEGORIES.map((c) => `<option ${p.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select>
-          </div>
+        <div class="field"><label>Product ID / SKU</label><input name="sku" value="${escapeHtml(p.sku || '')}" placeholder="Auto-generated if left blank"></div>
+        <div class="field"><label>Product Name</label><input name="name" required value="${escapeHtml(p.name || '')}" placeholder="e.g. Fast Charger 20W / ፈጣን ቻርጀር"></div>
+        <div class="field"><label>Category</label>
+          <select name="category">${PRODUCT_CATEGORIES.map((c) => `<option ${p.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select>
         </div>
-        <div class="field"><label>SKU</label><input name="sku" value="${escapeHtml(p.sku || '')}" placeholder="Auto-generated if left blank"></div>
+        <div class="field"><label>Compatible Device Model</label><input name="compatibleModels" value="${escapeHtml(p.compatibleModels || '')}" placeholder="e.g. iPhone 13/14/15"></div>
+        <div class="field"><label>Variant Details</label><input name="color" value="${escapeHtml(p.color || '')}" placeholder="Color, material, wattage, length…"></div>
+        <div class="field"><label>Supplier ID</label><input name="supplier" value="${escapeHtml(p.supplier || '')}" placeholder="Vendor name or ID"></div>
         <div class="field-row">
-          <div class="field"><label>Cost Price (ETB)</label><input name="costPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.costPrice ?? ''}" required></div>
-          <div class="field"><label>Selling Price (ETB)</label><input name="sellingPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.sellingPrice ?? ''}" required></div>
+          <div class="field"><label>Cost Price (ETB)</label><input id="pf-cost" name="costPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.costPrice ?? ''}" required></div>
+          <div class="field"><label>Selling Price (ETB)</label><input id="pf-sell" name="sellingPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.sellingPrice ?? ''}" required></div>
         </div>
+        <div class="field" style="text-align:right;font-size:13px;color:var(--ink-muted)">Profit margin per item: <strong id="pf-margin">Br ${fmtMoney(margin)}</strong></div>
         <div class="field-row">
-          <div class="field"><label>Wholesale Price (ETB, optional)</label><input name="wholesalePrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.wholesalePrice ?? ''}"></div>
-          <div class="field"><label>Quantity</label><input name="quantity" type="number" inputmode="numeric" min="0" step="1" value="${p.quantity ?? 0}" required></div>
+          <div class="field"><label>Current Stock Level</label><input name="quantity" type="number" inputmode="numeric" min="0" step="1" value="${p.quantity ?? 0}" required></div>
+          <div class="field"><label>Low Stock Threshold</label><input name="minStock" type="number" inputmode="numeric" min="0" step="1" value="${p.minStock ?? S.settings.lowStockDefault}"></div>
         </div>
-        <div class="field-row">
-          <div class="field"><label>Min Stock Threshold</label><input name="minStock" type="number" inputmode="numeric" min="0" step="1" value="${p.minStock ?? S.settings.lowStockDefault}"></div>
-          <div class="field"><label>Color</label><input name="color" value="${escapeHtml(p.color || '')}"></div>
-        </div>
-        <div class="field"><label>Compatible Models</label><input name="compatibleModels" value="${escapeHtml(p.compatibleModels || '')}" placeholder="e.g. iPhone 13/14/15"></div>
-        <div class="field-row">
-          <div class="field"><label>Supplier</label><input name="supplier" value="${escapeHtml(p.supplier || '')}"></div>
-          <div class="field"><label>Barcode</label><input name="barcode" value="${escapeHtml(p.barcode || '')}"></div>
-        </div>
-        <div class="field"><label>Notes</label><textarea name="notes">${escapeHtml(p.notes || '')}</textarea></div>
+        ${isEdit ? `<div class="field-row">
+          <div class="field"><label>Movement Status</label><div>${movementStatusFor(p)}</div></div>
+          <div class="field"><label>Date of Entry</label><div>${p.createdAt ? new Date(p.createdAt).toLocaleDateString() : '—'}</div></div>
+        </div>` : ''}
         <div class="btn-row">
           ${isEdit ? '<button type="button" class="btn danger" id="product-delete">Delete</button>' : ''}
           <button type="submit" class="btn primary block">${isEdit ? 'Save changes' : 'Add product'}</button>
@@ -708,27 +735,29 @@
       </form>`, (modal) => {
       qs('[data-close]', modal).onclick = closeModal;
       const form = qs('#product-form', modal);
+      const costEl = qs('#pf-cost', modal), sellEl = qs('#pf-sell', modal), marginEl = qs('#pf-margin', modal);
+      const updateMargin = () => {
+        marginEl.textContent = `Br ${fmtMoney((parseFloat(sellEl.value) || 0) - (parseFloat(costEl.value) || 0))}`;
+      };
+      costEl.addEventListener('input', updateMargin);
+      sellEl.addEventListener('input', updateMargin);
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         const fd = new FormData(form);
         const data = {
           name: fd.get('name').trim(),
-          brand: fd.get('brand').trim(),
           category: fd.get('category'),
           costPrice: parseFloat(fd.get('costPrice')) || 0,
           sellingPrice: parseFloat(fd.get('sellingPrice')) || 0,
-          wholesalePrice: fd.get('wholesalePrice') ? parseFloat(fd.get('wholesalePrice')) : null,
           quantity: parseInt(fd.get('quantity'), 10) || 0,
           minStock: parseInt(fd.get('minStock'), 10) || 0,
           compatibleModels: fd.get('compatibleModels').trim(),
           color: fd.get('color').trim(),
           supplier: fd.get('supplier').trim(),
-          barcode: fd.get('barcode').trim(),
-          notes: fd.get('notes').trim(),
         };
         if (!S.settings.allowNegativeStock && data.quantity < 0) { toast('Negative stock is not allowed (change in Settings)', 'error'); return; }
         let sku = fd.get('sku').trim();
-        if (!sku) sku = nextSku(data.category, data.brand);
+        if (!sku) sku = nextSku(data.category, p.brand);
         const dup = S.productIndex.find((x) => x.sku === sku && (!isEdit || x.id !== p.id));
         if (dup) { toast(`SKU "${sku}" already exists`, 'error'); return; }
         data.sku = sku;
