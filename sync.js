@@ -16,10 +16,29 @@
 
 import { supabase, getShopId } from './supabase-client.js';
 
-const db = new Dexie('DuketDB'); // same DB app.js opened — Dexie shares connections by name
-// NOTE: this file does not declare .version()/.stores() itself; app.js
-// (loaded after this file) owns the schema. Dexie queues operations until
-// the DB is actually open, so this is safe regardless of script order.
+// IMPORTANT: this file must NOT do `new Dexie('DuketDB')` itself. Dexie only
+// creates table properties (db.settings, db.products, ...) on an instance
+// that has actually declared them via .version().stores() — a second,
+// schema-less instance pointed at the same IndexedDB database does NOT
+// inherit those properties, so e.g. `db.settings` would be undefined and
+// `db.settings.get(...)` would throw. (This used to be a real bug here.)
+//
+// Instead, reuse the single Dexie instance app.js opens and schemas —
+// exposed as window.DuketDB. app.js is a deferred classic script that
+// runs AFTER this module, so window.DuketDB isn't set yet while this file
+// is first evaluated; the calls below only happen later (once syncNow()
+// actually runs, via startAutoSync(), which app.js itself only calls once
+// it's done booting) — by then window.DuketDB is set. This proxy defers
+// the lookup of window.DuketDB until each property is actually accessed,
+// so it stays safe regardless of script order.
+const db = new Proxy({}, {
+  get(_target, prop) {
+    if (!window.DuketDB) {
+      throw new Error('sync.js: window.DuketDB is not ready yet — app.js must run and open the database first.');
+    }
+    return window.DuketDB[prop];
+  }
+});
 
 /** Look up a row's uuid from its local Dexie id. */
 async function uuidFor(table, localId) {
