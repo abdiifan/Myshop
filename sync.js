@@ -43,7 +43,7 @@ async function localIdFor(table, uuid) {
 // ---------------------------------------------------------------------
 const TABLES = [
   {
-    local: 'accounts', remote: 'accounts',
+    local: 'accounts', remote: 'accounts', deletable: true,
     toRemote: (a, shopId) => ({
       id: a.uuid, shop_id: shopId, label: a.label, type: a.type,
       number_or_phone: a.numberOrPhone || ''
@@ -53,7 +53,7 @@ const TABLES = [
     })
   },
   {
-    local: 'suppliers', remote: 'suppliers',
+    local: 'suppliers', remote: 'suppliers', deletable: true,
     toRemote: (s, shopId) => ({
       id: s.uuid, shop_id: shopId, name: s.name, phone: s.phone || '',
       tin: s.tin || '', address: s.address || '', balance: s.balance || 0
@@ -64,18 +64,28 @@ const TABLES = [
     })
   },
   {
-    local: 'customers', remote: 'customers',
+    local: 'customers', remote: 'customers', deletable: true,
+    // NOTE: `balance` here is a display cache only — the real value is
+    // derived locally as balanceBaseline + sum(that customer's sales), see
+    // recomputeCustomerBalances() below. balanceBaseline is what's
+    // authoritative and must round-trip through sync.
     toRemote: (c, shopId) => ({
       id: c.uuid, shop_id: shopId, name: c.name, phone: c.phone || '',
-      credit_limit: c.creditLimit || 0, due_date: c.dueDate || null, balance: c.balance || 0
+      credit_limit: c.creditLimit || 0, due_date: c.dueDate || null,
+      balance: c.balance || 0, balance_baseline: c.balanceBaseline || 0
     }),
     fromRemote: (r) => ({
       uuid: r.id, name: r.name, phone: r.phone, creditLimit: r.credit_limit,
-      dueDate: r.due_date, balance: r.balance, synced: 1
+      dueDate: r.due_date, balance: r.balance, balanceBaseline: r.balance_baseline || 0, synced: 1
     })
   },
   {
-    local: 'products', remote: 'products',
+    local: 'products', remote: 'products', deletable: true,
+    // NOTE: `quantity` here is a display cache only — the real value is
+    // derived locally from the stockMovements ledger, see
+    // recomputeProductQuantities() below. Pulling a remote quantity value
+    // is intentionally NOT authoritative (fromRemote omits it) so a stale
+    // or racy remote figure can never overwrite the locally-derived one.
     toRemote: (p, shopId) => ({
       id: p.uuid, shop_id: shopId, sku: p.sku, name: p.name, brand: p.brand || '',
       category: p.category || 'Other', barcode: p.barcode || '',
@@ -87,7 +97,7 @@ const TABLES = [
     fromRemote: (r) => ({
       uuid: r.id, sku: r.sku, name: r.name, brand: r.brand, category: r.category,
       barcode: r.barcode, costPrice: r.cost_price, sellingPrice: r.selling_price,
-      wholesalePrice: r.wholesale_price, quantity: r.quantity, minStock: r.low_stock_threshold,
+      wholesalePrice: r.wholesale_price, minStock: r.low_stock_threshold,
       compatibleModels: r.compatible_models, color: r.color, supplier: r.supplier,
       notes: r.notes, synced: 1
     })
@@ -172,11 +182,23 @@ async function pushTable(cfg, shopId) {
   for (const row of dirty) {
     try {
       if (row.deleted) {
-        if (row.id != null) await supabase.from(cfg.remote).delete().eq('id', row.uuid);
-        await db[cfg.local].delete(row.id); // fully remove locally now that it's synced
+        if (cfg.deletable && row.uuid) {
+          // Soft-delete remotely (tombstone) instead of a hard DELETE.
+          // A hard delete makes the row vanish from pullTable's
+          // `updated_at`-based query entirely, so OTHER devices would never
+          // learn the row was removed and would keep it (or even resurrect
+          // it) forever. Upserting `deleted: true` keeps a row other
+          // devices' pulls will actually see, so they can remove it too.
+          const payload = await cfg.toRemote(row, shopId);
+          payload.deleted = true;
+          const { error } = await supabase.from(cfg.remote).upsert(payload);
+          if (error) { console.warn(`[sync] push (delete) ${cfg.local} failed`, error.message); continue; }
+        }
+        await db[cfg.local].delete(row.id); // local copy no longer needed once the tombstone is pushed
         continue;
       }
       const payload = await cfg.toRemote(row, shopId);
+      if (cfg.deletable) payload.deleted = false;
       const { error } = await supabase.from(cfg.remote).upsert(payload);
       if (error) { console.warn(`[sync] push ${cfg.local} failed`, error.message); continue; }
       await db[cfg.local].update(row.id, { synced: 1 });
@@ -198,18 +220,53 @@ async function pullTable(cfg, shopId) {
     .eq('shop_id', shopId)
     .gt('updated_at', since);
 
-  if (error) { console.warn(`[sync] pull ${cfg.local} failed`, error.message); return; }
-  if (!data || !data.length) return;
+  if (error) { console.warn(`[sync] pull ${cfg.local} failed`, error.message); return []; }
+  if (!data || !data.length) return [];
 
   let maxUpdated = since;
   for (const remoteRow of data) {
-    const mapped = await cfg.fromRemote(remoteRow);
     const existing = await db[cfg.local].where('uuid').equals(remoteRow.id).first();
-    if (existing) await db[cfg.local].update(existing.id, mapped);
-    else await db[cfg.local].add(mapped);
+    if (cfg.deletable && remoteRow.deleted) {
+      // Tombstone from another device — remove locally too, if present.
+      if (existing) await db[cfg.local].delete(existing.id);
+    } else {
+      const mapped = await cfg.fromRemote(remoteRow);
+      if (existing) await db[cfg.local].update(existing.id, mapped);
+      else await db[cfg.local].add(mapped);
+    }
     if (remoteRow.updated_at > maxUpdated) maxUpdated = remoteRow.updated_at;
   }
   localStorage.setItem(lastSyncKey, maxUpdated);
+  return data;
+}
+
+// ---------------------------------------------------------------------
+// Derived-value recompute: mirrors recomputeProductQty() / 
+// recomputeCustomerBalance() in app.js. product.quantity and
+// customer.balance are caches derived from additive, conflict-free rows
+// (stockMovements and sales respectively) — never trusted directly from a
+// synced row — so a concurrent edit on another device can't clobber them.
+// Run this after every pull so newly-arrived movements/sales from other
+// devices are reflected immediately.
+// ---------------------------------------------------------------------
+async function recomputeProductQuantities(productIds) {
+  for (const id of productIds) {
+    const moves = await db.stockMovements.where('productId').equals(id).toArray();
+    const qty = moves.reduce((s, m) => s + (m.quantity || 0), 0);
+    const p = await db.products.get(id);
+    if (p && p.quantity !== qty) await db.products.update(id, { quantity: qty, synced: 1 });
+  }
+}
+
+async function recomputeCustomerBalances(customerIds) {
+  for (const id of customerIds) {
+    const customer = await db.customers.get(id);
+    if (!customer) continue;
+    const sales = await db.sales.where('customerId').equals(id).toArray();
+    const salesSum = sales.reduce((s, x) => s + (x.total || 0), 0);
+    const balance = (customer.balanceBaseline || 0) + salesSum;
+    if (customer.balance !== balance) await db.customers.update(id, { balance, synced: 1 });
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -279,7 +336,26 @@ export async function syncNow() {
   try {
     await syncShopSettings(shopId);
     for (const cfg of TABLES) await pushTable(cfg, shopId);
-    for (const cfg of TABLES) await pullTable(cfg, shopId);
+
+    const touchedProducts = new Set();
+    const touchedCustomers = new Set();
+    for (const cfg of TABLES) {
+      const pulled = await pullTable(cfg, shopId);
+      if (!pulled || !pulled.length) continue;
+      if (cfg.local === 'stockMovements') {
+        for (const r of pulled) {
+          const localId = await localIdFor('products', r.product_id);
+          if (localId != null) touchedProducts.add(localId);
+        }
+      } else if (cfg.local === 'sales') {
+        for (const r of pulled) {
+          const localId = await localIdFor('customers', r.customer_id);
+          if (localId != null) touchedCustomers.add(localId);
+        }
+      }
+    }
+    if (touchedProducts.size) await recomputeProductQuantities(touchedProducts);
+    if (touchedCustomers.size) await recomputeCustomerBalances(touchedCustomers);
   } finally {
     syncing = false;
   }
