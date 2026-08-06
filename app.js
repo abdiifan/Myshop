@@ -119,6 +119,30 @@
      Database (Dexie)
      --------------------------------------------------------------------- */
   const db = new Dexie('DuketDB');
+  // If another tab already has this DB open at an older schema version, a
+  // db.version() bump (like v3 below) can't proceed until that tab closes
+  // its connection — and by default Dexie just hangs silently waiting,
+  // with no error and no UI feedback. These two handlers make that
+  // recoverable instead of an indefinite blank "Loading…" screen:
+  db.on('versionchange', () => {
+    // Fires in an OLDER already-open tab when a NEWER tab/version wants to
+    // upgrade. Close our connection so the newer tab can proceed, and tell
+    // this (stale) tab to reload.
+    db.close();
+    const root = document.getElementById('app') || document.body;
+    root.innerHTML = `
+      <div class="onboard">
+        <h1>My Shop</h1>
+        <p>This app was updated. Please reload this tab.</p>
+        <button class="btn primary block" onclick="location.reload()">Reload</button>
+      </div>`;
+  });
+  db.on('blocked', () => {
+    // Fires in THIS tab if some other open tab/window (running old code
+    // without the handler above, e.g. not yet reloaded) is preventing the
+    // upgrade. Surface it instead of leaving the loading screen frozen.
+    console.warn('[db] upgrade blocked by another open tab — close other My Shop tabs/windows and reload');
+  });
   db.version(1).stores({
     products: '++id, &sku, name, brand, category, barcode, quantity',
     sales: '++id, date, paymentAccountId, customerId',
@@ -227,6 +251,14 @@
     await db.customers.update(customerId, { balance });
     return balance;
   }
+
+  // Expose this instance so sync.js can reuse it instead of opening a
+  // second, separately-schema'd Dexie('DuketDB') connection. Dexie only
+  // creates table properties (db.settings, db.products, ...) on instances
+  // that actually declared them via .version().stores() — a second
+  // instance with no schema of its own gets none of those properties,
+  // even though it points at the same underlying IndexedDB database.
+  window.DuketDB = db;
 
   // Auto-tag every locally created/edited row so the sync loop knows what's
   // dirty, without touching any of the existing db.TABLE.add()/.update()
@@ -1847,10 +1879,31 @@
     if (window.DuketSync) {
       const root = document.getElementById('app') || document.body;
       root.innerHTML = `<div class="empty" style="padding-top:40vh"><div class="ic" style="font-size:32px">🏪</div><p>Loading your shop…</p></div>`;
-      await window.DuketSync.syncNow();
+      // This is supposed to be offline-first — a stalled/slow network call
+      // here must never block the whole app forever. Give the initial sync
+      // a few seconds, then boot from local data regardless; startAutoSync()
+      // keeps retrying quietly in the background either way.
+      await Promise.race([
+        window.DuketSync.syncNow().catch((err) => console.warn('[sync] initial sync failed', err)),
+        new Promise((resolve) => setTimeout(resolve, 8000))
+      ]);
       window.DuketSync.startAutoSync();
     }
-    boot();
+    try {
+      await boot();
+    } catch (err) {
+      // Never leave the static "Loading…" placeholder up with no
+      // explanation — show the actual error and a way out.
+      console.error('[boot] failed', err);
+      const root = document.getElementById('app') || document.body;
+      root.innerHTML = `
+        <div class="onboard">
+          <h1>My Shop</h1>
+          <p style="color:var(--danger)">Something went wrong while starting the app.</p>
+          <p style="font-size:12px;color:var(--ink-faint);word-break:break-all">${escapeHtml(String((err && err.message) || err))}</p>
+          <button class="btn primary block" onclick="location.reload()">Reload</button>
+        </div>`;
+    }
   }
 
   // If the session is ever cleared — user signs out, token revoked/expired,
