@@ -1,5 +1,5 @@
 /* ==========================================================================
-   My Shop — Inventory & POS  (single-file vanilla JS PWA)
+   Duket — Inventory & POS  (single-file vanilla JS PWA)
    All data lives in IndexedDB via Dexie. localStorage is used ONLY for the
    dark-mode preference. No frameworks, no build step — open index.html or
    serve the folder as-is.
@@ -119,30 +119,6 @@
      Database (Dexie)
      --------------------------------------------------------------------- */
   const db = new Dexie('DuketDB');
-  // If another tab already has this DB open at an older schema version, a
-  // db.version() bump (like v3 below) can't proceed until that tab closes
-  // its connection — and by default Dexie just hangs silently waiting,
-  // with no error and no UI feedback. These two handlers make that
-  // recoverable instead of an indefinite blank "Loading…" screen:
-  db.on('versionchange', () => {
-    // Fires in an OLDER already-open tab when a NEWER tab/version wants to
-    // upgrade. Close our connection so the newer tab can proceed, and tell
-    // this (stale) tab to reload.
-    db.close();
-    const root = document.getElementById('app') || document.body;
-    root.innerHTML = `
-      <div class="onboard">
-        <h1>My Shop</h1>
-        <p>This app was updated. Please reload this tab.</p>
-        <button class="btn primary block" onclick="location.reload()">Reload</button>
-      </div>`;
-  });
-  db.on('blocked', () => {
-    // Fires in THIS tab if some other open tab/window (running old code
-    // without the handler above, e.g. not yet reloaded) is preventing the
-    // upgrade. Surface it instead of leaving the loading screen frozen.
-    console.warn('[db] upgrade blocked by another open tab — close other My Shop tabs/windows and reload');
-  });
   db.version(1).stores({
     products: '++id, &sku, name, brand, category, barcode, quantity',
     sales: '++id, date, paymentAccountId, customerId',
@@ -154,124 +130,6 @@
     accounts: '++id, label, type',
     settings: '&key'
   });
-  // v2: adds `uuid` (shared with the Supabase row id), `synced` (0/1 dirty
-  // flag) and `deleted` (soft-delete flag) to every table that syncs to
-  // Supabase. See supabase-client.js / sync.js.
-  db.version(2).stores({
-    products: '++id, &sku, name, brand, category, barcode, quantity, uuid, synced, deleted',
-    sales: '++id, date, paymentAccountId, customerId, uuid, synced',
-    saleItems: '++id, saleId, productId, uuid, synced',
-    purchases: '++id, date, supplierId, productId, uuid, synced',
-    suppliers: '++id, name, uuid, synced, deleted',
-    customers: '++id, name, phone, uuid, synced, deleted',
-    stockMovements: '++id, date, productId, type, uuid, synced',
-    accounts: '++id, label, type, uuid, synced, deleted',
-    settings: '&key'
-  }).upgrade(async (tx) => {
-    // Backfill uuid/synced on rows created before sync existed.
-    for (const name of ['products', 'sales', 'saleItems', 'purchases', 'suppliers', 'customers', 'stockMovements', 'accounts']) {
-      await tx.table(name).toCollection().modify((row) => {
-        if (!row.uuid) row.uuid = crypto.randomUUID();
-        if (row.synced == null) row.synced = 0;
-      });
-    }
-  });
-  // v3: makes product.quantity and customer.balance DERIVED values instead
-  // of directly-synced fields. Two devices editing the same product/customer
-  // offline used to silently clobber each other's stock/balance change on
-  // sync (last full-row write wins). Now every change is an additive,
-  // conflict-free row (stockMovements / sales), and quantity/balance are
-  // recomputed locally from those rows — see recomputeProductQty() and
-  // recomputeCustomerBalance() below, and the mirrored batch recompute
-  // logic in sync.js (recomputeProductQuantities/recomputeCustomerBalances,
-  // run after every pull).
-  db.version(3).stores({
-    products: '++id, &sku, name, brand, category, barcode, quantity, uuid, synced, deleted',
-    sales: '++id, date, paymentAccountId, customerId, uuid, synced',
-    saleItems: '++id, saleId, productId, uuid, synced',
-    purchases: '++id, date, supplierId, productId, uuid, synced',
-    suppliers: '++id, name, uuid, synced, deleted',
-    customers: '++id, name, phone, uuid, synced, deleted',
-    stockMovements: '++id, date, productId, type, uuid, synced',
-    accounts: '++id, label, type, uuid, synced, deleted',
-    settings: '&key'
-  }).upgrade(async (tx) => {
-    // Give every product a baseline "initial" stock movement equal to
-    // (current quantity - sum of its existing movements), so that summing
-    // stockMovements reproduces today's on-screen quantity exactly. From
-    // this point on, quantity is always recomputed from movements — never
-    // trusted from a synced row — so a concurrent sale on another device
-    // can no longer overwrite it.
-    const products = await tx.table('products').toArray();
-    for (const p of products) {
-      const moves = await tx.table('stockMovements').where('productId').equals(p.id).toArray();
-      const existingSum = moves.reduce((s, m) => s + (m.quantity || 0), 0);
-      const baseline = (p.quantity || 0) - existingSum;
-      if (baseline !== 0) {
-        await tx.table('stockMovements').add({
-          date: p.createdAt || Date.now(), productId: p.id, type: 'initial',
-          quantity: baseline, reason: 'Migration baseline', note: '',
-          uuid: crypto.randomUUID(), synced: 0
-        });
-      }
-    }
-    // Same idea for customer balances: baseline = current balance minus the
-    // sum of their existing credit sales, so recomputing (baseline + sum of
-    // that customer's sales) reproduces today's balance exactly.
-    const customers = await tx.table('customers').toArray();
-    const sales = await tx.table('sales').toArray();
-    for (const c of customers) {
-      const salesSum = sales.filter((s) => s.customerId === c.id).reduce((s, x) => s + (x.total || 0), 0);
-      await tx.table('customers').update(c.id, { balanceBaseline: (c.balance || 0) - salesSum });
-    }
-  });
-
-  /** Recompute one product's quantity from its stockMovements ledger and
-   *  persist it as a local cache field. Movements are additive, append-only
-   *  rows — summing them gives the same answer on every device regardless
-   *  of sync order, unlike writing `quantity` directly. */
-  async function recomputeProductQty(productId) {
-    const moves = await db.stockMovements.where('productId').equals(productId).toArray();
-    const qty = moves.reduce((s, m) => s + (m.quantity || 0), 0);
-    await db.products.update(productId, { quantity: qty });
-    return qty;
-  }
-
-  /** Recompute one customer's balance = manual baseline + sum of their
-   *  credit sales. Sales are additive rows too, so this is race-free the
-   *  same way product quantity is. */
-  async function recomputeCustomerBalance(customerId) {
-    const [customer, sales] = await Promise.all([
-      db.customers.get(customerId),
-      db.sales.where('customerId').equals(customerId).toArray()
-    ]);
-    if (!customer) return;
-    const salesSum = sales.reduce((s, x) => s + (x.total || 0), 0);
-    const balance = (customer.balanceBaseline || 0) + salesSum;
-    await db.customers.update(customerId, { balance });
-    return balance;
-  }
-
-  // Expose this instance so sync.js can reuse it instead of opening a
-  // second, separately-schema'd Dexie('DuketDB') connection. Dexie only
-  // creates table properties (db.settings, db.products, ...) on instances
-  // that actually declared them via .version().stores() — a second
-  // instance with no schema of its own gets none of those properties,
-  // even though it points at the same underlying IndexedDB database.
-  window.DuketDB = db;
-
-  // Auto-tag every locally created/edited row so the sync loop knows what's
-  // dirty, without touching any of the existing db.TABLE.add()/.update()
-  // call sites elsewhere in this file.
-  for (const name of ['products', 'sales', 'saleItems', 'purchases', 'suppliers', 'customers', 'stockMovements', 'accounts']) {
-    db[name].hook('creating', (primKey, obj) => {
-      if (!obj.uuid) obj.uuid = crypto.randomUUID();
-      obj.synced = 0;
-    });
-    db[name].hook('updating', (mods) => {
-      if (mods.synced === undefined) return { synced: 0 };
-    });
-  }
 
   /* ---------------------------------------------------------------------
      Global state
@@ -292,12 +150,6 @@
     peopleTab: 'suppliers',    // 'suppliers' | 'customers'
     reportsRange: { from: daysAgo(6), to: startOfDay(new Date()) },
     chartLoaded: false,
-    reportsSubTab: 'inventory', // 'inventory' | 'sales' | 'profitability'
-    invFilter: { category: 'All', model: 'All', supplier: 'All', status: 'All' },
-    salesPeriod: 'daily',       // 'daily' | 'weekly' | 'monthly'
-    salesDay: startOfDay(new Date()),
-    salesWeekAnchor: startOfDay(new Date()),
-    salesMonth: new Date().toISOString().slice(0, 7), // 'YYYY-MM'
   };
 
   document.documentElement.setAttribute('data-theme', S.theme);
@@ -329,47 +181,16 @@
       ]);
     }
     S.settings = shop;
-    S.accounts = (await db.accounts.toArray()).filter((a) => !a.deleted);
+    S.accounts = await db.accounts.toArray();
   }
 
-  async function refreshAccounts() { S.accounts = (await db.accounts.toArray()).filter((a) => !a.deleted); }
+  async function refreshAccounts() { S.accounts = await db.accounts.toArray(); }
 
   /* ---------------------------------------------------------------------
      Product index cache (name/sku/brand/barcode search + virtual list)
      --------------------------------------------------------------------- */
   async function rebuildProductIndex() {
-    S.productIndex = (await db.products.toArray()).filter((p) => !p.deleted);
-    await rebuildMovementMap();
-  }
-
-  /* ---------------------------------------------------------------------
-     Movement status ("Fast-Moving" / "Slow-Moving" / "Dead Stock" / "New")
-     Computed from stockMovements 'sale' rows — not user-entered.
-       Fast-Moving: last sale within 7 days
-       Slow-Moving: last sale within 30 days
-       Dead Stock:  no sale in 30+ days (and not a brand-new product)
-       New:         added < 30 days ago with no sales yet
-     --------------------------------------------------------------------- */
-  async function rebuildMovementMap() {
-    const lastSale = {};
-    const movements = await db.stockMovements.where('type').equals('sale').toArray();
-    for (const m of movements) {
-      if (!lastSale[m.productId] || m.date > lastSale[m.productId]) lastSale[m.productId] = m.date;
-    }
-    S.movementMap = lastSale;
-  }
-
-  function movementStatusFor(p) {
-    const last = S.movementMap ? S.movementMap[p.id] : null;
-    const DAY = 86400000;
-    if (!last) {
-      const age = Date.now() - (p.createdAt || 0);
-      return age < 30 * DAY ? 'New' : 'Dead Stock';
-    }
-    const days = (Date.now() - last) / DAY;
-    if (days <= 7) return 'Fast-Moving';
-    if (days <= 30) return 'Slow-Moving';
-    return 'Dead Stock';
+    S.productIndex = await db.products.toArray();
   }
 
   function searchProducts(query, category) {
@@ -451,7 +272,7 @@
     const app = qs('#app');
     app.innerHTML = `
       <header class="topbar">
-        <div class="brand"><span class="dot"></span>My Shop <span class="offline-pill">OFFLINE</span></div>
+        <div class="brand"><span class="dot"></span>Duket <span class="offline-pill">OFFLINE</span></div>
         <div class="actions">
           <button class="iconbtn" id="theme-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">${S.theme === 'dark' ? '☀️' : '🌙'}</button>
         </div>
@@ -744,7 +565,7 @@
           <div class="emoji">${emojiFor(p.category)}</div>
           <div class="info">
             <div class="name">${escapeHtml(p.name)}</div>
-            <div class="meta">${escapeHtml(p.sku)} · ${movementStatusFor(p)}</div>
+            <div class="meta">${escapeHtml(p.sku)} · ${escapeHtml(p.brand || '')}</div>
           </div>
           <div class="price">
             <div class="sell num">Br ${fmtMoney(p.sellingPrice)}</div>
@@ -803,13 +624,7 @@
         });
         added++;
       }
-      if (toAdd.length) {
-        const ids = await db.products.bulkAdd(toAdd, { allKeys: true });
-        const moves = ids
-          .map((id, i) => ({ date: Date.now(), productId: id, type: 'initial', quantity: toAdd[i].quantity || 0, reason: 'CSV import', note: '' }))
-          .filter((m) => m.quantity !== 0);
-        if (moves.length) await db.stockMovements.bulkAdd(moves);
-      }
+      if (toAdd.length) await db.products.bulkAdd(toAdd);
       await rebuildProductIndex();
       renderProductsBody();
       toast(`Imported ${added} product${added === 1 ? '' : 's'}${skipped ? `, skipped ${skipped} duplicate SKU(s)` : ''}`);
@@ -822,31 +637,35 @@
   function openProductModal(product) {
     const isEdit = !!product;
     const p = product || { category: 'Phone' };
-    const margin = (p.sellingPrice || 0) - (p.costPrice || 0);
     openModal(`
       <div class="modal-head"><h3>${isEdit ? 'Edit product' : 'Add product'}</h3><button class="modal-close" data-close>✕</button></div>
       <form id="product-form">
-        <div class="field"><label>Product ID / SKU</label><input name="sku" value="${escapeHtml(p.sku || '')}" placeholder="Auto-generated if left blank"></div>
-        <div class="field"><label>Product Name</label><input name="name" required value="${escapeHtml(p.name || '')}" placeholder="e.g. Fast Charger 20W / ፈጣን ቻርጀር"></div>
-        <div class="field"><label>Category</label>
-          <select name="category">${PRODUCT_CATEGORIES.map((c) => `<option ${p.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select>
-        </div>
-        <div class="field"><label>Compatible Device Model</label><input name="compatibleModels" value="${escapeHtml(p.compatibleModels || '')}" placeholder="e.g. iPhone 13/14/15"></div>
-        <div class="field"><label>Variant Details</label><input name="color" value="${escapeHtml(p.color || '')}" placeholder="Color, material, wattage, length…"></div>
-        <div class="field"><label>Supplier ID</label><input name="supplier" value="${escapeHtml(p.supplier || '')}" placeholder="Vendor name or ID"></div>
+        <div class="field"><label>Name (English/Amharic)</label><input name="name" required value="${escapeHtml(p.name || '')}" placeholder="e.g. Fast Charger 20W / ፈጣን ቻርጀር"></div>
         <div class="field-row">
-          <div class="field"><label>Cost Price (ETB)</label><input id="pf-cost" name="costPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.costPrice ?? ''}" required></div>
-          <div class="field"><label>Selling Price (ETB)</label><input id="pf-sell" name="sellingPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.sellingPrice ?? ''}" required></div>
+          <div class="field"><label>Brand</label><input name="brand" value="${escapeHtml(p.brand || '')}"></div>
+          <div class="field"><label>Category</label>
+            <select name="category">${PRODUCT_CATEGORIES.map((c) => `<option ${p.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select>
+          </div>
         </div>
-        <div class="field" style="text-align:right;font-size:13px;color:var(--ink-muted)">Profit margin per item: <strong id="pf-margin">Br ${fmtMoney(margin)}</strong></div>
+        <div class="field"><label>SKU</label><input name="sku" value="${escapeHtml(p.sku || '')}" placeholder="Auto-generated if left blank"></div>
         <div class="field-row">
-          <div class="field"><label>Current Stock Level</label><input name="quantity" type="number" inputmode="numeric" min="0" step="1" value="${p.quantity ?? 0}" required></div>
-          <div class="field"><label>Low Stock Threshold</label><input name="minStock" type="number" inputmode="numeric" min="0" step="1" value="${p.minStock ?? S.settings.lowStockDefault}"></div>
+          <div class="field"><label>Cost Price (ETB)</label><input name="costPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.costPrice ?? ''}" required></div>
+          <div class="field"><label>Selling Price (ETB)</label><input name="sellingPrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.sellingPrice ?? ''}" required></div>
         </div>
-        ${isEdit ? `<div class="field-row">
-          <div class="field"><label>Movement Status</label><div>${movementStatusFor(p)}</div></div>
-          <div class="field"><label>Date of Entry</label><div>${p.createdAt ? new Date(p.createdAt).toLocaleDateString() : '—'}</div></div>
-        </div>` : ''}
+        <div class="field-row">
+          <div class="field"><label>Wholesale Price (ETB, optional)</label><input name="wholesalePrice" type="number" inputmode="numeric" min="0" step="0.01" value="${p.wholesalePrice ?? ''}"></div>
+          <div class="field"><label>Quantity</label><input name="quantity" type="number" inputmode="numeric" min="0" step="1" value="${p.quantity ?? 0}" required></div>
+        </div>
+        <div class="field-row">
+          <div class="field"><label>Min Stock Threshold</label><input name="minStock" type="number" inputmode="numeric" min="0" step="1" value="${p.minStock ?? S.settings.lowStockDefault}"></div>
+          <div class="field"><label>Color</label><input name="color" value="${escapeHtml(p.color || '')}"></div>
+        </div>
+        <div class="field"><label>Compatible Models</label><input name="compatibleModels" value="${escapeHtml(p.compatibleModels || '')}" placeholder="e.g. iPhone 13/14/15"></div>
+        <div class="field-row">
+          <div class="field"><label>Supplier</label><input name="supplier" value="${escapeHtml(p.supplier || '')}"></div>
+          <div class="field"><label>Barcode</label><input name="barcode" value="${escapeHtml(p.barcode || '')}"></div>
+        </div>
+        <div class="field"><label>Notes</label><textarea name="notes">${escapeHtml(p.notes || '')}</textarea></div>
         <div class="btn-row">
           ${isEdit ? '<button type="button" class="btn danger" id="product-delete">Delete</button>' : ''}
           <button type="submit" class="btn primary block">${isEdit ? 'Save changes' : 'Add product'}</button>
@@ -854,56 +673,37 @@
       </form>`, (modal) => {
       qs('[data-close]', modal).onclick = closeModal;
       const form = qs('#product-form', modal);
-      const costEl = qs('#pf-cost', modal), sellEl = qs('#pf-sell', modal), marginEl = qs('#pf-margin', modal);
-      const updateMargin = () => {
-        marginEl.textContent = `Br ${fmtMoney((parseFloat(sellEl.value) || 0) - (parseFloat(costEl.value) || 0))}`;
-      };
-      costEl.addEventListener('input', updateMargin);
-      sellEl.addEventListener('input', updateMargin);
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
         const fd = new FormData(form);
         const data = {
           name: fd.get('name').trim(),
+          brand: fd.get('brand').trim(),
           category: fd.get('category'),
           costPrice: parseFloat(fd.get('costPrice')) || 0,
           sellingPrice: parseFloat(fd.get('sellingPrice')) || 0,
+          wholesalePrice: fd.get('wholesalePrice') ? parseFloat(fd.get('wholesalePrice')) : null,
           quantity: parseInt(fd.get('quantity'), 10) || 0,
           minStock: parseInt(fd.get('minStock'), 10) || 0,
           compatibleModels: fd.get('compatibleModels').trim(),
           color: fd.get('color').trim(),
           supplier: fd.get('supplier').trim(),
+          barcode: fd.get('barcode').trim(),
+          notes: fd.get('notes').trim(),
         };
         if (!S.settings.allowNegativeStock && data.quantity < 0) { toast('Negative stock is not allowed (change in Settings)', 'error'); return; }
         let sku = fd.get('sku').trim();
-        if (!sku) sku = nextSku(data.category, p.brand);
+        if (!sku) sku = nextSku(data.category, data.brand);
         const dup = S.productIndex.find((x) => x.sku === sku && (!isEdit || x.id !== p.id));
         if (dup) { toast(`SKU "${sku}" already exists`, 'error'); return; }
         data.sku = sku;
-        const enteredQty = data.quantity;
-        delete data.quantity; // quantity is derived from stockMovements, never written directly (see recomputeProductQty)
         try {
           if (isEdit) {
-            await db.transaction('rw', db.products, db.stockMovements, async () => {
-              await db.products.update(p.id, data);
-              // Treat a manual "Current Stock Level" edit as a correction
-              // movement rather than an absolute overwrite, so it merges
-              // cleanly with movements recorded on other devices instead
-              // of silently discarding them.
-              const delta = enteredQty - (p.quantity || 0);
-              if (delta !== 0) {
-                await db.stockMovements.add({ date: Date.now(), productId: p.id, type: 'correction', quantity: delta, reason: 'Manual edit', note: '' });
-              }
-              await recomputeProductQty(p.id);
-            });
+            await db.products.update(p.id, data);
             toast('Product updated');
           } else {
             data.createdAt = Date.now();
-            const newId = await db.products.add(data);
-            if (enteredQty) {
-              await db.stockMovements.add({ date: Date.now(), productId: newId, type: 'initial', quantity: enteredQty, reason: 'Initial stock', note: '' });
-            }
-            await recomputeProductQty(newId);
+            await db.products.add(data);
             toast('Product added');
           }
           await rebuildProductIndex();
@@ -920,7 +720,7 @@
         qs('#product-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete product?', `This removes "${p.name}" permanently. Sales history referencing it is kept.`, 'Delete');
           if (!ok) return;
-          await db.products.update(p.id, { deleted: 1 });
+          await db.products.delete(p.id);
           await rebuildProductIndex();
           closeModal();
           renderProductsBody();
@@ -983,12 +783,9 @@
       if (!product) { toast('Pick a valid product from the list', 'error'); return; }
       const qty = parseInt(fd.get('qty'), 10);
       const unitCost = parseFloat(fd.get('unitCost'));
-      await db.transaction('rw', db.products, db.purchases, db.stockMovements, async () => {
-        await db.products.update(product.id, { costPrice: unitCost });
-        await db.purchases.add({ date: Date.now(), productId: product.id, quantity: qty, unitCost, supplier: fd.get('supplier') || '', invoice: fd.get('invoice') || '' });
-        await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'in', quantity: qty, reason: 'Stock In', note: fd.get('invoice') || '' });
-        await recomputeProductQty(product.id);
-      });
+      await db.products.update(product.id, { quantity: product.quantity + qty, costPrice: unitCost });
+      await db.purchases.add({ date: Date.now(), productId: product.id, quantity: qty, unitCost, supplier: fd.get('supplier') || '', invoice: fd.get('invoice') || '' });
+      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'in', quantity: qty, reason: 'Stock In', note: fd.get('invoice') || '' });
       await rebuildProductIndex();
       toast(`+${qty} added to ${product.name}`);
       e.target.reset();
@@ -1024,10 +821,8 @@
       if (!delta) { toast('Enter a non-zero quantity change', 'error'); return; }
       const newQty = product.quantity + delta;
       if (!S.settings.allowNegativeStock && newQty < 0) { toast('That would take stock negative (disallowed in Settings)', 'error'); return; }
-      await db.transaction('rw', db.products, db.stockMovements, async () => {
-        await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'adjust', quantity: delta, reason, note: fd.get('note') || '' });
-        await recomputeProductQty(product.id);
-      });
+      await db.products.update(product.id, { quantity: newQty });
+      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'adjust', quantity: delta, reason, note: fd.get('note') || '' });
       await rebuildProductIndex();
       toast(`Adjusted ${product.name} by ${delta > 0 ? '+' : ''}${delta}`);
       e.target.reset();
@@ -1054,7 +849,7 @@
   /* ----- Suppliers / Customers ----- */
   async function renderPeopleTab(body, kind) {
     const table = kind === 'suppliers' ? db.suppliers : db.customers;
-    const list = (await table.toArray()).filter((x) => !x.deleted);
+    const list = await table.toArray();
     body.innerHTML = `
       <div class="btn-row" style="margin-bottom:10px"><button class="btn primary sm" id="add-person">+ Add ${kind === 'suppliers' ? 'Supplier' : 'Customer'}</button></div>
       <div id="people-list"></div>`;
@@ -1103,34 +898,11 @@
       qs('#person-form', modal).addEventListener('submit', async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
-        const enteredBalance = parseFloat(fd.get('balance')) || 0;
-        const data = { name: fd.get('name').trim(), phone: fd.get('phone').trim() };
-        if (isSupplier) {
-          // Suppliers have no automatic balance increments anywhere in the
-          // app (no auto-debit-on-purchase flow), so a plain last-write-wins
-          // field is fine here — this is always an explicit manual figure.
-          data.balance = enteredBalance;
-          data.tin = fd.get('tin').trim(); data.address = fd.get('address').trim();
-          if (isEdit) await db.suppliers.update(p.id, data); else await db.suppliers.add(data);
-        } else {
-          data.creditLimit = parseFloat(fd.get('creditLimit')) || 0;
-          if (isEdit) {
-            // Customer balance is derived (baseline + sum of their credit
-            // sales, see recomputeCustomerBalance) so it merges correctly
-            // with credit sales recorded on other devices instead of a
-            // manual edit silently discarding them. Solve for the baseline
-            // that makes the derived balance equal what was typed in.
-            const sales = await db.customers.get(p.id).then(() => db.sales.where('customerId').equals(p.id).toArray());
-            const salesSum = sales.reduce((s, x) => s + (x.total || 0), 0);
-            data.balanceBaseline = enteredBalance - salesSum;
-            await db.customers.update(p.id, data);
-            await recomputeCustomerBalance(p.id);
-          } else {
-            data.balanceBaseline = enteredBalance; // no sales yet, baseline == entered value
-            const newId = await db.customers.add(data);
-            await recomputeCustomerBalance(newId);
-          }
-        }
+        const data = { name: fd.get('name').trim(), phone: fd.get('phone').trim(), balance: parseFloat(fd.get('balance')) || 0 };
+        if (isSupplier) { data.tin = fd.get('tin').trim(); data.address = fd.get('address').trim(); }
+        else { data.creditLimit = parseFloat(fd.get('creditLimit')) || 0; }
+        const table = isSupplier ? db.suppliers : db.customers;
+        if (isEdit) await table.update(p.id, data); else await table.add(data);
         closeModal();
         renderProductsBody();
         toast('Saved');
@@ -1139,7 +911,7 @@
         qs('#person-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete?', `Remove "${p.name}" from your ${isSupplier ? 'suppliers' : 'customers'} list.`, 'Delete');
           if (!ok) return;
-          await (isSupplier ? db.suppliers : db.customers).update(p.id, { deleted: 1 });
+          await (isSupplier ? db.suppliers : db.customers).delete(p.id);
           closeModal(); renderProductsBody();
         };
       }
@@ -1291,14 +1063,16 @@
     const account = S.accounts.find((a) => a.id == S.posAccountId);
     if (!account) { toast('Choose a receiving account', 'error'); return; }
 
-    let customerId = null, customerName = '', payerRef = '', dueDate = null, isNewCustomer = false;
+    let customerId = null, customerName = '', payerRef = '';
     if (account.type === 'credit') {
       const name = (qs('#pos-cust-name', el) || {}).value?.trim();
       if (!name) { toast('Customer name is required for a credit sale', 'error'); return; }
       const phone = (qs('#pos-cust-phone', el) || {}).value?.trim() || '';
-      dueDate = (qs('#pos-cust-due', el) || {}).value || '';
-      const cust = (await db.customers.toArray()).find((c) => c.name.toLowerCase() === name.toLowerCase() && c.phone === phone);
-      if (cust) customerId = cust.id; else isNewCustomer = true;
+      const due = (qs('#pos-cust-due', el) || {}).value || '';
+      let cust = (await db.customers.toArray()).find((c) => c.name.toLowerCase() === name.toLowerCase() && c.phone === phone);
+      if (!cust) { customerId = await db.customers.add({ name, phone, creditLimit: 0, balance: 0 }); }
+      else customerId = cust.id;
+      await db.customers.update(customerId, { balance: ((await db.customers.get(customerId)).balance || 0) + total, dueDate: due });
       customerName = name;
     } else if (account.type === 'mobile_money' || account.type === 'bank') {
       payerRef = (qs('#pos-payer-ref', el) || {}).value?.trim() || '';
@@ -1314,34 +1088,18 @@
 
     try {
       const profit = S.cart.reduce((s, c) => s + (c.price - c.cost) * c.qty, 0) - discount;
-      let saleId;
-      // Whole sale is one atomic Dexie transaction: either every table gets
-      // written (sale, items, stock movements, customer) or none do — a
-      // crash or full-storage error mid-checkout can no longer leave a sale
-      // recorded with only some items' stock decremented.
-      await db.transaction('rw', db.sales, db.saleItems, db.products, db.stockMovements, db.customers, async () => {
-        if (isNewCustomer) {
-          customerId = await db.customers.add({ name: customerName, phone: (qs('#pos-cust-phone', el) || {}).value?.trim() || '', creditLimit: 0, balanceBaseline: 0, balance: 0 });
-        }
-        saleId = await db.sales.add({
-          date: Date.now(), subtotal, discount, total, profit,
-          paymentAccountId: account.id, paymentAccountLabel: account.label,
-          payerReference: payerRef, customerId, customerName,
-        });
-        for (const c of S.cart) {
-          await db.saleItems.add({ saleId, productId: c.productId, name: c.name, qty: c.qty, price: c.price, costAtSale: c.cost });
-          await db.stockMovements.add({ date: Date.now(), productId: c.productId, type: 'sale', quantity: -c.qty, reason: 'Sale', note: `Sale #${saleId}` });
-          await recomputeProductQty(c.productId);
-        }
-        if (customerId != null) {
-          // Balance is derived (baseline + sum of that customer's sales),
-          // so recording the sale above is already enough — no separate
-          // read-modify-write on `balance` that another device's concurrent
-          // credit sale could clobber. Just refresh the cached display value.
-          if (dueDate) await db.customers.update(customerId, { dueDate });
-          await recomputeCustomerBalance(customerId);
-        }
+      const saleId = await db.sales.add({
+        date: Date.now(), subtotal, discount, total, profit,
+        paymentAccountId: account.id, paymentAccountLabel: account.label,
+        payerReference: payerRef, customerId, customerName,
       });
+      for (const c of S.cart) {
+        await db.saleItems.add({ saleId, productId: c.productId, name: c.name, qty: c.qty, price: c.price, costAtSale: c.cost });
+        const p = S.productIndex.find((x) => x.id === c.productId);
+        const newQty = (p ? p.quantity : 0) - c.qty;
+        await db.products.update(c.productId, { quantity: newQty });
+        await db.stockMovements.add({ date: Date.now(), productId: c.productId, type: 'sale', quantity: -c.qty, reason: 'Sale', note: `Sale #${saleId}` });
+      }
       await rebuildProductIndex();
       printReceipt({ saleId, items: S.cart.slice(), subtotal, discount, total, account, payerRef, customerName });
       S.cart = [];
@@ -1358,7 +1116,7 @@
   function printReceipt({ saleId, items, subtotal, discount, total, account, payerRef, customerName }) {
     const s = S.settings;
     const html = `
-      <h2>${escapeHtml(s.name || 'My Shop')}</h2>
+      <h2>${escapeHtml(s.name || 'Duket Shop')}</h2>
       <div class="center">${escapeHtml(s.address || '')}</div>
       <div class="center">${s.phone ? 'Tel: ' + escapeHtml(s.phone) : ''}</div>
       <div class="center">${s.tin ? 'TIN: ' + escapeHtml(s.tin) : ''}</div>
@@ -1588,13 +1346,7 @@
           <div class="btn-row"><button class="btn ${S.theme === 'light' ? 'primary' : 'ghost'} sm" data-theme-opt="light">☀️ Light</button>
             <button class="btn ${S.theme === 'dark' ? 'primary' : 'ghost'} sm" data-theme-opt="dark">🌙 Dark</button></div>
         </div>
-
-        ${window.DuketAuth ? `
-        <div class="section-title">Account</div>
-        <div class="card">
-          <button class="btn ghost block" id="sign-out">Sign out</button>
-        </div>` : ''}
-        <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">My Shop v1.1 · All data stored on this device</p>`;
+        <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">Duket v1.0 · All data stored on this device</p>`;
     },
     mount(el) {
       qs('#shop-form', el).addEventListener('submit', async (e) => {
@@ -1617,17 +1369,6 @@
         if (b.dataset.themeOpt !== S.theme) toggleTheme();
         showView('settings');
       }));
-      if (window.DuketAuth) {
-        qs('#sign-out', el).addEventListener('click', async () => {
-          const ok = await confirmDialog('Sign out?', 'Any unsynced changes will finish uploading first if you\'re online.', 'Sign out');
-          if (!ok) return;
-          if (window.DuketSync) await window.DuketSync.syncNow();
-          await window.DuketAuth.signOut();
-          // renderLoginScreen is also triggered by the onAuthChange('SIGNED_OUT')
-          // listener, but call it directly here too for an instant response.
-          renderLoginScreen('signIn');
-        });
-      }
     }
   };
 
@@ -1682,7 +1423,7 @@
         qs('#account-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete account?', `Remove "${a.label}" from payment options.`, 'Delete');
           if (!ok) return;
-          await db.accounts.update(a.id, { deleted: 1 });
+          await db.accounts.delete(a.id);
           await refreshAccounts();
           closeModal();
           showView('settings');
@@ -1757,7 +1498,7 @@
     app.innerHTML = `
       <div class="onboarding">
         <div class="ic">🏪</div>
-        <h1>Welcome to My Shop</h1>
+        <h1>Welcome to Duket</h1>
         <p>Your offline inventory &amp; point-of-sale manager. Let's set up your shop — this only takes a moment, and everything stays on this device.</p>
         <form id="onboard-form" style="text-align:left">
           <div class="field"><label>Shop name</label><input name="name" required placeholder="e.g. Selam Mobile Accessories"></div>
@@ -1785,135 +1526,9 @@
     renderShell();
     showView('dashboard');
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js').then((reg) => {
-        // With a cache-first service worker, a shop's device can otherwise
-        // keep running old app code forever after an update ships, with no
-        // sign anything is wrong. Detect the new version and prompt instead
-        // of silently staying stale.
-        const promptForReload = (worker) => {
-          const box = ce('div', { class: 'toast update-toast' }, 'Update available — tap to refresh');
-          box.style.cursor = 'pointer';
-          box.addEventListener('click', () => { worker.postMessage('skipWaiting'); });
-          qs('#toasts').appendChild(box);
-        };
-        if (reg.waiting) promptForReload(reg.waiting);
-        reg.addEventListener('updatefound', () => {
-          const nw = reg.installing;
-          if (!nw) return;
-          nw.addEventListener('statechange', () => {
-            if (nw.state === 'installed' && navigator.serviceWorker.controller) promptForReload(nw);
-          });
-        });
-        let reloading = false;
-        navigator.serviceWorker.addEventListener('controllerchange', () => {
-          if (reloading) return;
-          reloading = true;
-          window.location.reload();
-        });
-      }).catch((err) => console.warn('SW registration failed', err));
-    }
-    // Kick off background sync now that the app is usable. Safe to call
-    // even if the device is offline or Supabase isn't configured yet —
-    // sync.js no-ops in that case.
-    if (window.DuketSync) window.DuketSync.startAutoSync();
-  }
-
-  /* ---------------------------------------------------------------------
-     Auth gate — shown before boot() if Supabase auth is configured and no
-     session exists yet. If supabase-client.js wasn't loaded (e.g. you
-     haven't wired Supabase in yet), this falls straight through to boot()
-     so the app keeps working exactly as before, offline-only.
-     --------------------------------------------------------------------- */
-  function renderLoginScreen(mode = 'signIn') {
-    const root = document.getElementById('app') || document.body;
-    root.innerHTML = `
-      <div class="onboard">
-        <h1>My Shop</h1>
-        <p>${mode === 'signIn' ? 'Sign in to your shop' : 'Create your shop account'}</p>
-        <form id="auth-form">
-          <div class="field"><label>Email</label><input name="email" type="email" required></div>
-          <div class="field"><label>Password</label><input name="password" type="password" minlength="8" required></div>
-          <button class="btn primary block" type="submit">${mode === 'signIn' ? 'Sign in' : 'Sign up'}</button>
-        </form>
-        <button class="btn ghost block" id="auth-switch">${mode === 'signIn' ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}</button>
-        <div id="auth-error" style="color:var(--danger);margin-top:8px"></div>
-      </div>`;
-    qs('#auth-switch').addEventListener('click', () => renderLoginScreen(mode === 'signIn' ? 'signUp' : 'signIn'));
-    qs('#auth-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const fd = new FormData(e.target);
-      const email = fd.get('email').trim();
-      const password = fd.get('password');
-      const errEl = qs('#auth-error');
-      errEl.textContent = '';
-      const { error } = mode === 'signIn'
-        ? await window.DuketAuth.signIn(email, password)
-        : await window.DuketAuth.signUp(email, password);
-      if (error) { errEl.textContent = error.message; return; }
-      if (mode === 'signUp') { errEl.style.color = 'var(--success)'; errEl.textContent = 'Account created — check your email if confirmation is required, then sign in.'; return; }
-      startApp();
-    });
-  }
-
-  async function startApp() {
-    if (!window.DuketAuth) {
-      // Supabase script failed to load/execute — do NOT let anyone into the
-      // app in this state. Show an explicit error instead of silently
-      // booting into local data.
-      const root = document.getElementById('app') || document.body;
-      root.innerHTML = `
-        <div class="onboard">
-          <h1>My Shop</h1>
-          <p style="color:var(--danger)">Couldn't reach the sign-in service. Check your connection and reload.</p>
-          <button class="btn primary block" onclick="location.reload()">Retry</button>
-        </div>`;
-      return;
-    }
-    const session = await window.DuketAuth.getSession();
-    if (!session) { renderLoginScreen('signIn'); return; }
-
-    // Pull this shop's existing data down BEFORE ensureDefaults()/boot()
-    // decide what to render — otherwise a fresh/second device sees its own
-    // blank local defaults and shows onboarding instead of the real shop
-    // data that already exists on the server.
-    if (window.DuketSync) {
-      const root = document.getElementById('app') || document.body;
-      root.innerHTML = `<div class="empty" style="padding-top:40vh"><div class="ic" style="font-size:32px">🏪</div><p>Loading your shop…</p></div>`;
-      // This is supposed to be offline-first — a stalled/slow network call
-      // here must never block the whole app forever. Give the initial sync
-      // a few seconds, then boot from local data regardless; startAutoSync()
-      // keeps retrying quietly in the background either way.
-      await Promise.race([
-        window.DuketSync.syncNow().catch((err) => console.warn('[sync] initial sync failed', err)),
-        new Promise((resolve) => setTimeout(resolve, 8000))
-      ]);
-      window.DuketSync.startAutoSync();
-    }
-    try {
-      await boot();
-    } catch (err) {
-      // Never leave the static "Loading…" placeholder up with no
-      // explanation — show the actual error and a way out.
-      console.error('[boot] failed', err);
-      const root = document.getElementById('app') || document.body;
-      root.innerHTML = `
-        <div class="onboard">
-          <h1>My Shop</h1>
-          <p style="color:var(--danger)">Something went wrong while starting the app.</p>
-          <p style="font-size:12px;color:var(--ink-faint);word-break:break-all">${escapeHtml(String((err && err.message) || err))}</p>
-          <button class="btn primary block" onclick="location.reload()">Reload</button>
-        </div>`;
+      navigator.serviceWorker.register('./sw.js').catch((err) => console.warn('SW registration failed', err));
     }
   }
 
-  // If the session is ever cleared — user signs out, token revoked/expired,
-  // or they sign out in another tab — immediately drop back to the login
-  // screen instead of leaving whatever was on screen visible/usable.
-  if (window.DuketAuth) {
-    window.DuketAuth.onAuthChange((event) => {
-      if (event === 'SIGNED_OUT') renderLoginScreen('signIn');
-    });
-  }
-
-  startApp();
+  boot();
 })();
