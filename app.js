@@ -152,6 +152,81 @@
       });
     }
   });
+  // v3: makes product.quantity and customer.balance DERIVED values instead
+  // of directly-synced fields. Two devices editing the same product/customer
+  // offline used to silently clobber each other's stock/balance change on
+  // sync (last full-row write wins). Now every change is an additive,
+  // conflict-free row (stockMovements / sales), and quantity/balance are
+  // recomputed locally from those rows — see recomputeProductQty() and
+  // recomputeCustomerBalance() below, and the mirrored batch recompute
+  // logic in sync.js (recomputeProductQuantities/recomputeCustomerBalances,
+  // run after every pull).
+  db.version(3).stores({
+    products: '++id, &sku, name, brand, category, barcode, quantity, uuid, synced, deleted',
+    sales: '++id, date, paymentAccountId, customerId, uuid, synced',
+    saleItems: '++id, saleId, productId, uuid, synced',
+    purchases: '++id, date, supplierId, productId, uuid, synced',
+    suppliers: '++id, name, uuid, synced, deleted',
+    customers: '++id, name, phone, uuid, synced, deleted',
+    stockMovements: '++id, date, productId, type, uuid, synced',
+    accounts: '++id, label, type, uuid, synced, deleted',
+    settings: '&key'
+  }).upgrade(async (tx) => {
+    // Give every product a baseline "initial" stock movement equal to
+    // (current quantity - sum of its existing movements), so that summing
+    // stockMovements reproduces today's on-screen quantity exactly. From
+    // this point on, quantity is always recomputed from movements — never
+    // trusted from a synced row — so a concurrent sale on another device
+    // can no longer overwrite it.
+    const products = await tx.table('products').toArray();
+    for (const p of products) {
+      const moves = await tx.table('stockMovements').where('productId').equals(p.id).toArray();
+      const existingSum = moves.reduce((s, m) => s + (m.quantity || 0), 0);
+      const baseline = (p.quantity || 0) - existingSum;
+      if (baseline !== 0) {
+        await tx.table('stockMovements').add({
+          date: p.createdAt || Date.now(), productId: p.id, type: 'initial',
+          quantity: baseline, reason: 'Migration baseline', note: '',
+          uuid: crypto.randomUUID(), synced: 0
+        });
+      }
+    }
+    // Same idea for customer balances: baseline = current balance minus the
+    // sum of their existing credit sales, so recomputing (baseline + sum of
+    // that customer's sales) reproduces today's balance exactly.
+    const customers = await tx.table('customers').toArray();
+    const sales = await tx.table('sales').toArray();
+    for (const c of customers) {
+      const salesSum = sales.filter((s) => s.customerId === c.id).reduce((s, x) => s + (x.total || 0), 0);
+      await tx.table('customers').update(c.id, { balanceBaseline: (c.balance || 0) - salesSum });
+    }
+  });
+
+  /** Recompute one product's quantity from its stockMovements ledger and
+   *  persist it as a local cache field. Movements are additive, append-only
+   *  rows — summing them gives the same answer on every device regardless
+   *  of sync order, unlike writing `quantity` directly. */
+  async function recomputeProductQty(productId) {
+    const moves = await db.stockMovements.where('productId').equals(productId).toArray();
+    const qty = moves.reduce((s, m) => s + (m.quantity || 0), 0);
+    await db.products.update(productId, { quantity: qty });
+    return qty;
+  }
+
+  /** Recompute one customer's balance = manual baseline + sum of their
+   *  credit sales. Sales are additive rows too, so this is race-free the
+   *  same way product quantity is. */
+  async function recomputeCustomerBalance(customerId) {
+    const [customer, sales] = await Promise.all([
+      db.customers.get(customerId),
+      db.sales.where('customerId').equals(customerId).toArray()
+    ]);
+    if (!customer) return;
+    const salesSum = sales.reduce((s, x) => s + (x.total || 0), 0);
+    const balance = (customer.balanceBaseline || 0) + salesSum;
+    await db.customers.update(customerId, { balance });
+    return balance;
+  }
 
   // Auto-tag every locally created/edited row so the sync loop knows what's
   // dirty, without touching any of the existing db.TABLE.add()/.update()
@@ -696,7 +771,13 @@
         });
         added++;
       }
-      if (toAdd.length) await db.products.bulkAdd(toAdd);
+      if (toAdd.length) {
+        const ids = await db.products.bulkAdd(toAdd, { allKeys: true });
+        const moves = ids
+          .map((id, i) => ({ date: Date.now(), productId: id, type: 'initial', quantity: toAdd[i].quantity || 0, reason: 'CSV import', note: '' }))
+          .filter((m) => m.quantity !== 0);
+        if (moves.length) await db.stockMovements.bulkAdd(moves);
+      }
       await rebuildProductIndex();
       renderProductsBody();
       toast(`Imported ${added} product${added === 1 ? '' : 's'}${skipped ? `, skipped ${skipped} duplicate SKU(s)` : ''}`);
@@ -767,13 +848,30 @@
         const dup = S.productIndex.find((x) => x.sku === sku && (!isEdit || x.id !== p.id));
         if (dup) { toast(`SKU "${sku}" already exists`, 'error'); return; }
         data.sku = sku;
+        const enteredQty = data.quantity;
+        delete data.quantity; // quantity is derived from stockMovements, never written directly (see recomputeProductQty)
         try {
           if (isEdit) {
-            await db.products.update(p.id, data);
+            await db.transaction('rw', db.products, db.stockMovements, async () => {
+              await db.products.update(p.id, data);
+              // Treat a manual "Current Stock Level" edit as a correction
+              // movement rather than an absolute overwrite, so it merges
+              // cleanly with movements recorded on other devices instead
+              // of silently discarding them.
+              const delta = enteredQty - (p.quantity || 0);
+              if (delta !== 0) {
+                await db.stockMovements.add({ date: Date.now(), productId: p.id, type: 'correction', quantity: delta, reason: 'Manual edit', note: '' });
+              }
+              await recomputeProductQty(p.id);
+            });
             toast('Product updated');
           } else {
             data.createdAt = Date.now();
-            await db.products.add(data);
+            const newId = await db.products.add(data);
+            if (enteredQty) {
+              await db.stockMovements.add({ date: Date.now(), productId: newId, type: 'initial', quantity: enteredQty, reason: 'Initial stock', note: '' });
+            }
+            await recomputeProductQty(newId);
             toast('Product added');
           }
           await rebuildProductIndex();
@@ -853,9 +951,12 @@
       if (!product) { toast('Pick a valid product from the list', 'error'); return; }
       const qty = parseInt(fd.get('qty'), 10);
       const unitCost = parseFloat(fd.get('unitCost'));
-      await db.products.update(product.id, { quantity: product.quantity + qty, costPrice: unitCost });
-      await db.purchases.add({ date: Date.now(), productId: product.id, quantity: qty, unitCost, supplier: fd.get('supplier') || '', invoice: fd.get('invoice') || '' });
-      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'in', quantity: qty, reason: 'Stock In', note: fd.get('invoice') || '' });
+      await db.transaction('rw', db.products, db.purchases, db.stockMovements, async () => {
+        await db.products.update(product.id, { costPrice: unitCost });
+        await db.purchases.add({ date: Date.now(), productId: product.id, quantity: qty, unitCost, supplier: fd.get('supplier') || '', invoice: fd.get('invoice') || '' });
+        await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'in', quantity: qty, reason: 'Stock In', note: fd.get('invoice') || '' });
+        await recomputeProductQty(product.id);
+      });
       await rebuildProductIndex();
       toast(`+${qty} added to ${product.name}`);
       e.target.reset();
@@ -891,8 +992,10 @@
       if (!delta) { toast('Enter a non-zero quantity change', 'error'); return; }
       const newQty = product.quantity + delta;
       if (!S.settings.allowNegativeStock && newQty < 0) { toast('That would take stock negative (disallowed in Settings)', 'error'); return; }
-      await db.products.update(product.id, { quantity: newQty });
-      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'adjust', quantity: delta, reason, note: fd.get('note') || '' });
+      await db.transaction('rw', db.products, db.stockMovements, async () => {
+        await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'adjust', quantity: delta, reason, note: fd.get('note') || '' });
+        await recomputeProductQty(product.id);
+      });
       await rebuildProductIndex();
       toast(`Adjusted ${product.name} by ${delta > 0 ? '+' : ''}${delta}`);
       e.target.reset();
@@ -968,11 +1071,34 @@
       qs('#person-form', modal).addEventListener('submit', async (e) => {
         e.preventDefault();
         const fd = new FormData(e.target);
-        const data = { name: fd.get('name').trim(), phone: fd.get('phone').trim(), balance: parseFloat(fd.get('balance')) || 0 };
-        if (isSupplier) { data.tin = fd.get('tin').trim(); data.address = fd.get('address').trim(); }
-        else { data.creditLimit = parseFloat(fd.get('creditLimit')) || 0; }
-        const table = isSupplier ? db.suppliers : db.customers;
-        if (isEdit) await table.update(p.id, data); else await table.add(data);
+        const enteredBalance = parseFloat(fd.get('balance')) || 0;
+        const data = { name: fd.get('name').trim(), phone: fd.get('phone').trim() };
+        if (isSupplier) {
+          // Suppliers have no automatic balance increments anywhere in the
+          // app (no auto-debit-on-purchase flow), so a plain last-write-wins
+          // field is fine here — this is always an explicit manual figure.
+          data.balance = enteredBalance;
+          data.tin = fd.get('tin').trim(); data.address = fd.get('address').trim();
+          if (isEdit) await db.suppliers.update(p.id, data); else await db.suppliers.add(data);
+        } else {
+          data.creditLimit = parseFloat(fd.get('creditLimit')) || 0;
+          if (isEdit) {
+            // Customer balance is derived (baseline + sum of their credit
+            // sales, see recomputeCustomerBalance) so it merges correctly
+            // with credit sales recorded on other devices instead of a
+            // manual edit silently discarding them. Solve for the baseline
+            // that makes the derived balance equal what was typed in.
+            const sales = await db.customers.get(p.id).then(() => db.sales.where('customerId').equals(p.id).toArray());
+            const salesSum = sales.reduce((s, x) => s + (x.total || 0), 0);
+            data.balanceBaseline = enteredBalance - salesSum;
+            await db.customers.update(p.id, data);
+            await recomputeCustomerBalance(p.id);
+          } else {
+            data.balanceBaseline = enteredBalance; // no sales yet, baseline == entered value
+            const newId = await db.customers.add(data);
+            await recomputeCustomerBalance(newId);
+          }
+        }
         closeModal();
         renderProductsBody();
         toast('Saved');
@@ -1133,16 +1259,14 @@
     const account = S.accounts.find((a) => a.id == S.posAccountId);
     if (!account) { toast('Choose a receiving account', 'error'); return; }
 
-    let customerId = null, customerName = '', payerRef = '';
+    let customerId = null, customerName = '', payerRef = '', dueDate = null, isNewCustomer = false;
     if (account.type === 'credit') {
       const name = (qs('#pos-cust-name', el) || {}).value?.trim();
       if (!name) { toast('Customer name is required for a credit sale', 'error'); return; }
       const phone = (qs('#pos-cust-phone', el) || {}).value?.trim() || '';
-      const due = (qs('#pos-cust-due', el) || {}).value || '';
-      let cust = (await db.customers.toArray()).find((c) => c.name.toLowerCase() === name.toLowerCase() && c.phone === phone);
-      if (!cust) { customerId = await db.customers.add({ name, phone, creditLimit: 0, balance: 0 }); }
-      else customerId = cust.id;
-      await db.customers.update(customerId, { balance: ((await db.customers.get(customerId)).balance || 0) + total, dueDate: due });
+      dueDate = (qs('#pos-cust-due', el) || {}).value || '';
+      const cust = (await db.customers.toArray()).find((c) => c.name.toLowerCase() === name.toLowerCase() && c.phone === phone);
+      if (cust) customerId = cust.id; else isNewCustomer = true;
       customerName = name;
     } else if (account.type === 'mobile_money' || account.type === 'bank') {
       payerRef = (qs('#pos-payer-ref', el) || {}).value?.trim() || '';
@@ -1158,18 +1282,34 @@
 
     try {
       const profit = S.cart.reduce((s, c) => s + (c.price - c.cost) * c.qty, 0) - discount;
-      const saleId = await db.sales.add({
-        date: Date.now(), subtotal, discount, total, profit,
-        paymentAccountId: account.id, paymentAccountLabel: account.label,
-        payerReference: payerRef, customerId, customerName,
+      let saleId;
+      // Whole sale is one atomic Dexie transaction: either every table gets
+      // written (sale, items, stock movements, customer) or none do — a
+      // crash or full-storage error mid-checkout can no longer leave a sale
+      // recorded with only some items' stock decremented.
+      await db.transaction('rw', db.sales, db.saleItems, db.products, db.stockMovements, db.customers, async () => {
+        if (isNewCustomer) {
+          customerId = await db.customers.add({ name: customerName, phone: (qs('#pos-cust-phone', el) || {}).value?.trim() || '', creditLimit: 0, balanceBaseline: 0, balance: 0 });
+        }
+        saleId = await db.sales.add({
+          date: Date.now(), subtotal, discount, total, profit,
+          paymentAccountId: account.id, paymentAccountLabel: account.label,
+          payerReference: payerRef, customerId, customerName,
+        });
+        for (const c of S.cart) {
+          await db.saleItems.add({ saleId, productId: c.productId, name: c.name, qty: c.qty, price: c.price, costAtSale: c.cost });
+          await db.stockMovements.add({ date: Date.now(), productId: c.productId, type: 'sale', quantity: -c.qty, reason: 'Sale', note: `Sale #${saleId}` });
+          await recomputeProductQty(c.productId);
+        }
+        if (customerId != null) {
+          // Balance is derived (baseline + sum of that customer's sales),
+          // so recording the sale above is already enough — no separate
+          // read-modify-write on `balance` that another device's concurrent
+          // credit sale could clobber. Just refresh the cached display value.
+          if (dueDate) await db.customers.update(customerId, { dueDate });
+          await recomputeCustomerBalance(customerId);
+        }
       });
-      for (const c of S.cart) {
-        await db.saleItems.add({ saleId, productId: c.productId, name: c.name, qty: c.qty, price: c.price, costAtSale: c.cost });
-        const p = S.productIndex.find((x) => x.id === c.productId);
-        const newQty = (p ? p.quantity : 0) - c.qty;
-        await db.products.update(c.productId, { quantity: newQty });
-        await db.stockMovements.add({ date: Date.now(), productId: c.productId, type: 'sale', quantity: -c.qty, reason: 'Sale', note: `Sale #${saleId}` });
-      }
       await rebuildProductIndex();
       printReceipt({ saleId, items: S.cart.slice(), subtotal, discount, total, account, payerRef, customerName });
       S.cart = [];
@@ -1422,7 +1562,7 @@
         <div class="card">
           <button class="btn ghost block" id="sign-out">Sign out</button>
         </div>` : ''}
-        <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">My Shop v1.0 · All data stored on this device</p>`;
+        <p style="text-align:center;font-size:11.5px;color:var(--ink-faint);margin:18px 0">My Shop v1.1 · All data stored on this device</p>`;
     },
     mount(el) {
       qs('#shop-form', el).addEventListener('submit', async (e) => {
@@ -1613,7 +1753,32 @@
     renderShell();
     showView('dashboard');
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js').catch((err) => console.warn('SW registration failed', err));
+      navigator.serviceWorker.register('./sw.js').then((reg) => {
+        // With a cache-first service worker, a shop's device can otherwise
+        // keep running old app code forever after an update ships, with no
+        // sign anything is wrong. Detect the new version and prompt instead
+        // of silently staying stale.
+        const promptForReload = (worker) => {
+          const box = ce('div', { class: 'toast update-toast' }, 'Update available — tap to refresh');
+          box.style.cursor = 'pointer';
+          box.addEventListener('click', () => { worker.postMessage('skipWaiting'); });
+          qs('#toasts').appendChild(box);
+        };
+        if (reg.waiting) promptForReload(reg.waiting);
+        reg.addEventListener('updatefound', () => {
+          const nw = reg.installing;
+          if (!nw) return;
+          nw.addEventListener('statechange', () => {
+            if (nw.state === 'installed' && navigator.serviceWorker.controller) promptForReload(nw);
+          });
+        });
+        let reloading = false;
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (reloading) return;
+          reloading = true;
+          window.location.reload();
+        });
+      }).catch((err) => console.warn('SW registration failed', err));
     }
     // Kick off background sync now that the app is usable. Safe to call
     // even if the device is offline or Supabase isn't configured yet —
@@ -1635,7 +1800,7 @@
         <p>${mode === 'signIn' ? 'Sign in to your shop' : 'Create your shop account'}</p>
         <form id="auth-form">
           <div class="field"><label>Email</label><input name="email" type="email" required></div>
-          <div class="field"><label>Password</label><input name="password" type="password" minlength="6" required></div>
+          <div class="field"><label>Password</label><input name="password" type="password" minlength="8" required></div>
           <button class="btn primary block" type="submit">${mode === 'signIn' ? 'Sign in' : 'Sign up'}</button>
         </form>
         <button class="btn ghost block" id="auth-switch">${mode === 'signIn' ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}</button>
