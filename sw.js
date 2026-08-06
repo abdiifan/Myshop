@@ -4,7 +4,7 @@
    Bump CACHE_VERSION whenever any precached file changes — this forces
    old clients to fetch the new files instead of serving stale ones.
    ========================================================================== */
-const CACHE_VERSION = 'duket-v1';
+const CACHE_VERSION = 'duket-v2';
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
@@ -23,8 +23,17 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(SHELL_CACHE)
       .then((cache) => cache.addAll(SHELL_ASSETS))
-      .then(() => self.skipWaiting())
+    // NOTE: no self.skipWaiting() here anymore — a new worker now waits
+    // until the page tells it to take over (see the 'message' listener
+    // below), which app.js triggers only after the user taps the
+    // "Update available" toast. Auto-activating instantly used to mean a
+    // shop mid-checkout could have its app code swapped under it with no
+    // warning.
   );
+});
+
+self.addEventListener('message', (event) => {
+  if (event.data === 'skipWaiting') self.skipWaiting();
 });
 
 self.addEventListener('activate', (event) => {
