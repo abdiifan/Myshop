@@ -326,6 +326,32 @@
     }
   });
 
+  // sync.js reads this database through window.MyShopDB (see the comment
+  // block at the top of sync.js) — without this line that global was never
+  // actually set, so every sync attempt crashed trying to read
+  // window.MyShopDB.settings off of undefined.
+  window.MyShopDB = db;
+
+  // If another tab/window (or the previously-installed PWA still running in
+  // the background) has an older version of this database open, the browser
+  // will silently block this version-2 upgrade from completing — no error,
+  // no timeout, it just hangs forever. Surface that instead of leaving the
+  // person stuck on "Loading My Shop…" with no explanation.
+  db.on('blocked', () => {
+    const app = qs('#app');
+    if (app) {
+      app.innerHTML = `
+        <div class="empty" style="padding-top:30vh">
+          <div class="ic">⚠️</div>
+          <h3>Update needs other tabs closed</h3>
+          <p style="max-width:320px;margin:0 auto">My Shop is open in another tab or window, which is blocking this update. Please close all other tabs/windows with My Shop open, then reload.</p>
+          <div style="margin-top:16px"><button class="btn primary" id="boot-retry">Reload</button></div>
+        </div>`;
+      const btn = qs('#boot-retry', app);
+      if (btn) btn.onclick = () => window.location.reload();
+    }
+  });
+
   /** Defensive backfill for rows that can arrive without uuid/synced set —
    *  e.g. a JSON backup restored from an older export. Cheap no-op once
    *  every row already has both fields. */
@@ -1826,7 +1852,130 @@
   }
 
   /* ---------------------------------------------------------------------
-     Onboarding (empty database, first run)
+     First launch — a device with no local shop yet must not silently
+     create a brand-new blank one until we've ruled out that this person
+     already has a shop in the cloud. Otherwise signing in on a second
+     device creates duplicate default accounts and can overwrite the real
+     shop's name/phone (see renderFirstLaunchChooser / attemptInitialSync).
+     --------------------------------------------------------------------- */
+  function renderFirstLaunchChooser() {
+    const app = qs('#app');
+    app.innerHTML = `
+      <div class="onboarding">
+        <div class="ic">🏪</div>
+        <h1>Welcome to My Shop</h1>
+        <p>Your offline inventory &amp; point-of-sale manager.</p>
+        <div style="display:flex;flex-direction:column;gap:10px;margin-top:22px">
+          <button class="btn primary block" id="choose-signin">I already use My Shop — Sign in</button>
+          <button class="btn block" id="choose-new">Set up a new shop</button>
+        </div>
+      </div>`;
+    qs('#choose-signin').onclick = renderFirstLaunchSignIn;
+    qs('#choose-new').onclick = async () => { await ensureDefaults(); renderOnboarding(); };
+  }
+
+  function renderFirstLaunchSignIn() {
+    const app = qs('#app');
+    app.innerHTML = `
+      <div class="onboarding">
+        <div class="ic">🏪</div>
+        <h1>Sign in</h1>
+        <p>Sign in with the account you already use for My Shop — we'll load your existing shop onto this device.</p>
+        <form id="first-signin-form" style="text-align:left">
+          <div class="field"><label>Email</label><input name="email" type="email" required></div>
+          <div class="field"><label>Password</label><input name="password" type="password" required></div>
+          <p id="signin-err" style="color:#c0392b;font-size:13px;display:none"></p>
+          <button class="btn primary block" type="submit">Sign in</button>
+        </form>
+        <p style="margin-top:14px"><a href="#" id="back-to-chooser">← Back</a></p>
+      </div>`;
+    qs('#back-to-chooser').addEventListener('click', (e) => { e.preventDefault(); renderFirstLaunchChooser(); });
+    qs('#first-signin-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const btn = e.target.querySelector('button[type=submit]');
+      btn.disabled = true;
+      const { error } = await window.MyShopAuth.signIn(fd.get('email').trim(), fd.get('password'));
+      if (error) {
+        btn.disabled = false;
+        const errEl = qs('#signin-err');
+        errEl.textContent = error.message || 'Sign in failed — check your email and password.';
+        errEl.style.display = 'block';
+        return;
+      }
+      await attemptInitialSync();
+    });
+  }
+
+  function renderAwaitingConnection() {
+    const app = qs('#app');
+    app.innerHTML = `
+      <div class="empty" style="padding-top:28vh">
+        <div class="ic">📶</div>
+        <h3>Connect to the internet to continue</h3>
+        <p style="max-width:320px;margin:0 auto">You're signed in — we just need one connection to pull your shop's existing data onto this device before you can use it.</p>
+        <div style="margin-top:16px;display:flex;gap:8px;justify-content:center">
+          <button class="btn primary" id="retry-sync">Retry</button>
+          <button class="btn" id="cancel-signin">Use offline instead</button>
+        </div>
+      </div>`;
+    qs('#retry-sync').onclick = () => attemptInitialSync();
+    qs('#cancel-signin').onclick = async () => {
+      await window.MyShopAuth.signOut();
+      renderFirstLaunchChooser();
+    };
+  }
+
+  /** Called right after a first-launch sign-in (and on boot if a session is
+   *  already present with no local shop yet). Pulls this account's existing
+   *  shop down BEFORE any local defaults exist, so nothing gets created or
+   *  pushed that could collide with or overwrite the real shop. Only if the
+   *  account genuinely has no shop yet does this fall through to onboarding
+   *  — at which point this device really is the first one, so creating
+   *  local defaults and pushing them up is correct. */
+  async function attemptInitialSync() {
+    const app = qs('#app');
+    app.innerHTML = `<div class="empty" style="padding-top:35vh"><div class="ic">☁️</div><p>Loading your shop…</p></div>`;
+
+    if (!navigator.onLine) { renderAwaitingConnection(); return; }
+
+    try {
+      await window.MyShopSync.syncNow();
+    } catch (err) {
+      console.error('Initial sync failed', err);
+    }
+
+    const shop = await db.settings.get('shop');
+    if (shop && shop.onboarded) {
+      await ensureDefaults();
+      await rebuildProductIndex();
+      renderShell();
+      showView('dashboard');
+      registerServiceWorker();
+      window.MyShopSync.startAutoSync();
+      window.MyShopAuth.onAuthChange((event, sess) => { if (sess) window.MyShopSync.startAutoSync(); });
+      return;
+    }
+
+    // Signed in, but this account has no existing shop on the server —
+    // genuine first-time setup. This device becomes the source of truth,
+    // so it's correct to create local defaults and push them up.
+    await ensureDefaults();
+    renderOnboarding();
+  }
+
+  function registerServiceWorker() {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js')
+        .then(setupUpdateFlow)
+        .catch((err) => console.warn('SW registration failed', err));
+    }
+  }
+
+  /* ---------------------------------------------------------------------
+     Onboarding — creating a brand-new local (and, once signed in, remote)
+     shop. Only ever reached once we've ruled out an existing shop already
+     belonging to this person (see attemptInitialSync / renderFirstLaunchChooser).
      --------------------------------------------------------------------- */
   function renderOnboarding() {
     const app = qs('#app');
@@ -1890,30 +2039,45 @@
      Boot
      --------------------------------------------------------------------- */
   async function boot() {
-    await ensureDefaults();
-    if (!S.settings.onboarded) { renderOnboarding(); return; }
-    await rebuildProductIndex();
-    renderShell();
-    showView('dashboard');
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('./sw.js')
-        .then(setupUpdateFlow)
-        .catch((err) => console.warn('SW registration failed', err));
+    const localShop = await db.settings.get('shop');
+
+    if (localShop && localShop.onboarded) {
+      // Returning device that already has a shop set up locally — the
+      // common case on every launch after the first. ensureDefaults() is
+      // still safe to call here: it only fills in defaults that are
+      // missing, it never overwrites what's already there.
+      await ensureDefaults();
+      await rebuildProductIndex();
+      renderShell();
+      showView('dashboard');
+      registerServiceWorker();
+      if (window.MyShopAuth && window.MyShopSync) {
+        const session = await window.MyShopAuth.getSession();
+        if (session) window.MyShopSync.startAutoSync();
+        window.MyShopAuth.onAuthChange((event, sess) => {
+          if (sess) window.MyShopSync.startAutoSync();
+        });
+      }
+      return;
     }
-    // Cloud sync: only kick off the auto-sync loop once we know a shop
-    // owner is actually signed in (startAutoSync() itself no-ops without a
-    // session, but there's no point running the 30s timer/online listener
-    // at all for the common signed-out, fully-local shop). onAuthChange
-    // also starts it the moment someone signs in from the Settings card,
-    // and stays subscribed for the rest of the session in case of a token
-    // refresh or a sign-in on a previously signed-out device.
+
+    // No local shop yet. Before creating one, find out whether this
+    // person already has a shop in the cloud — either because they're
+    // already signed in (session persisted from before), or because
+    // they're about to sign in from the first-launch chooser. Only once
+    // that's ruled out do we ever create local defaults or ask them to
+    // set up a brand-new shop (see attemptInitialSync / renderOnboarding).
     if (window.MyShopAuth && window.MyShopSync) {
       const session = await window.MyShopAuth.getSession();
-      if (session) window.MyShopSync.startAutoSync();
-      window.MyShopAuth.onAuthChange((event, sess) => {
-        if (sess) window.MyShopSync.startAutoSync();
-      });
+      if (session) { await attemptInitialSync(); return; }
+      renderFirstLaunchChooser();
+      return;
     }
+
+    // Cloud sync isn't available on this build — fall back to the
+    // original offline-only flow.
+    await ensureDefaults();
+    renderOnboarding();
   }
 
   boot().catch((err) => {
