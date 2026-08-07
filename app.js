@@ -30,6 +30,14 @@
     return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
   };
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  // RFC4122-ish UUID for rows that need to be identified across devices via
+  // Supabase (sync.js matches rows on this, not the local auto-increment id,
+  // since two devices can't share auto-increment counters).
+  const genUuid = () => (window.crypto && crypto.randomUUID) ? crypto.randomUUID() :
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
 
   const fmtMoney = (n) => {
     n = Number(n) || 0;
@@ -70,10 +78,17 @@
     };
     const lines = [headers.map(esc).join(',')];
     for (const r of rows) lines.push(headers.map((h) => esc(r[h])).join(','));
-    return lines.join('\n');
+    // Leading UTF-8 BOM: product names/notes/etc. are commonly typed in
+    // Amharic (Ethiopic script). Without a BOM, Excel — the tool most shop
+    // owners actually open CSVs in — misreads the encoding and shows
+    // mangled characters (mojibake) for any non-Latin text, even though the
+    // file itself is valid UTF-8. Browsers and other spreadsheet apps
+    // ignore the BOM harmlessly.
+    return '\ufeff' + lines.join('\n');
   }
   function parseCSV(text) {
     // Minimal RFC4180-ish parser: handles quoted fields with commas/newlines.
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // strip BOM if present (e.g. re-importing a CSV saved by Excel)
     const rows = [];
     let row = [], field = '', inQuotes = false;
     for (let i = 0; i < text.length; i++) {
@@ -130,6 +145,43 @@
     accounts: '++id, label, type',
     settings: '&key'
   });
+  // v2: adds `uuid` and `synced` as indexed fields. sync.js queries both
+  // with .where(...), which Dexie can only do on an indexed keyPath — without
+  // this, every sync attempt threw immediately ("KeyPath not indexed") and
+  // silently disabled sync entirely. The upgrade() backfills both fields on
+  // every row that predates this version, so existing local data gets a
+  // stable uuid and is marked dirty (synced=0) to be pushed on first sync.
+  const SYNCED_TABLES = ['products', 'sales', 'saleItems', 'purchases', 'suppliers', 'customers', 'stockMovements', 'accounts'];
+  db.version(2).stores({
+    products: '++id, &sku, name, brand, category, barcode, quantity, uuid, synced',
+    sales: '++id, date, paymentAccountId, customerId, uuid, synced',
+    saleItems: '++id, saleId, productId, uuid, synced',
+    purchases: '++id, date, supplierId, productId, uuid, synced',
+    suppliers: '++id, name, uuid, synced',
+    customers: '++id, name, phone, uuid, synced',
+    stockMovements: '++id, date, productId, type, uuid, synced',
+    accounts: '++id, label, type, uuid, synced',
+    settings: '&key'
+  }).upgrade(async (tx) => {
+    for (const name of SYNCED_TABLES) {
+      await tx.table(name).toCollection().modify((row) => {
+        if (!row.uuid) row.uuid = genUuid();
+        if (row.synced == null) row.synced = 0;
+      });
+    }
+  });
+
+  /** Defensive backfill for rows that can arrive without uuid/synced set —
+   *  e.g. a JSON backup restored from an older export. Cheap no-op once
+   *  every row already has both fields. */
+  async function backfillSyncFields() {
+    for (const name of SYNCED_TABLES) {
+      await db[name].toCollection().modify((row) => {
+        if (!row.uuid) row.uuid = genUuid();
+        if (row.synced == null) row.synced = 0;
+      });
+    }
+  }
 
   /* ---------------------------------------------------------------------
      Global state
@@ -173,24 +225,27 @@
     const accCount = await db.accounts.count();
     if (accCount === 0) {
       await db.accounts.bulkAdd([
-        { label: 'Cash Drawer', type: 'cash', numberOrPhone: '' },
-        { label: 'Telebirr', type: 'mobile_money', numberOrPhone: '' },
-        { label: 'CBE Birr', type: 'mobile_money', numberOrPhone: '' },
-        { label: 'Bank Transfer', type: 'bank', numberOrPhone: '' },
-        { label: 'Credit / Debt', type: 'credit', numberOrPhone: '' },
+        { label: 'Cash Drawer', type: 'cash', numberOrPhone: '', uuid: genUuid(), synced: 0 },
+        { label: 'Telebirr', type: 'mobile_money', numberOrPhone: '', uuid: genUuid(), synced: 0 },
+        { label: 'CBE Birr', type: 'mobile_money', numberOrPhone: '', uuid: genUuid(), synced: 0 },
+        { label: 'Bank Transfer', type: 'bank', numberOrPhone: '', uuid: genUuid(), synced: 0 },
+        { label: 'Credit / Debt', type: 'credit', numberOrPhone: '', uuid: genUuid(), synced: 0 },
       ]);
     }
     S.settings = shop;
-    S.accounts = await db.accounts.toArray();
+    S.accounts = (await db.accounts.toArray()).filter((a) => !a.deleted);
   }
 
-  async function refreshAccounts() { S.accounts = await db.accounts.toArray(); }
+  async function refreshAccounts() { S.accounts = (await db.accounts.toArray()).filter((a) => !a.deleted); }
 
   /* ---------------------------------------------------------------------
      Product index cache (name/sku/brand/barcode search + virtual list)
      --------------------------------------------------------------------- */
   async function rebuildProductIndex() {
-    S.productIndex = await db.products.toArray();
+    // Filter out soft-deleted rows (tombstoned locally so the deletion can
+    // still be pushed to Supabase on next sync, per sync.js's `deletable`
+    // contract) — they must never show up in the UI again.
+    S.productIndex = (await db.products.toArray()).filter((p) => !p.deleted);
   }
 
   function searchProducts(query, category) {
@@ -272,7 +327,7 @@
     const app = qs('#app');
     app.innerHTML = `
       <header class="topbar">
-        <div class="brand"><span class="dot"></span>Duket <span class="offline-pill">OFFLINE</span></div>
+        <div class="brand"><span class="dot"></span>Duket <span class="offline-pill" id="offline-pill">OFFLINE</span></div>
         <div class="actions">
           <button class="iconbtn" id="theme-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">${S.theme === 'dark' ? '☀️' : '🌙'}</button>
         </div>
@@ -300,7 +355,15 @@
   }
 
   function updateOfflinePill() {
+    // Previously this only toggled a class on <body> that no rule in
+    // styles.css actually reads, so the pill was permanently stuck showing
+    // "OFFLINE" — even with a live connection. Drive the pill directly.
     document.body.classList.toggle('offline', !navigator.onLine);
+    const pill = qs('#offline-pill');
+    if (!pill) return;
+    const online = navigator.onLine;
+    pill.textContent = online ? 'ONLINE' : 'OFFLINE';
+    pill.classList.toggle('online', online);
   }
   window.addEventListener('online', updateOfflinePill);
   window.addEventListener('offline', updateOfflinePill);
@@ -397,7 +460,7 @@
      --------------------------------------------------------------------- */
   VIEWS.dashboard = {
     async render() {
-      const products = S.productIndex.length ? S.productIndex : await db.products.toArray();
+      const products = S.productIndex.length ? S.productIndex : (await db.products.toArray()).filter((p) => !p.deleted);
       const totalSkus = products.length;
       const stockValue = products.reduce((s, p) => s + (p.costPrice || 0) * (p.quantity || 0), 0);
       const threshold = (p) => (p.minStock != null ? p.minStock : S.settings.lowStockDefault);
@@ -620,7 +683,8 @@
           wholesalePrice: parseFloat(r.wholesalePrice) || null,
           quantity: parseInt(r.quantity, 10) || 0, minStock: parseInt(r.minStock, 10) || S.settings.lowStockDefault,
           compatibleModels: r.compatibleModels || '', color: r.color || '', supplier: r.supplier || '',
-          barcode: r.barcode || '', notes: r.notes || '', createdAt: Date.now()
+          barcode: r.barcode || '', notes: r.notes || '', createdAt: Date.now(),
+          uuid: genUuid(), synced: 0
         });
         added++;
       }
@@ -699,10 +763,13 @@
         data.sku = sku;
         try {
           if (isEdit) {
+            data.synced = 0; // mark dirty so this edit gets pushed on next sync
             await db.products.update(p.id, data);
             toast('Product updated');
           } else {
             data.createdAt = Date.now();
+            data.uuid = genUuid();
+            data.synced = 0;
             await db.products.add(data);
             toast('Product added');
           }
@@ -720,7 +787,12 @@
         qs('#product-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete product?', `This removes "${p.name}" permanently. Sales history referencing it is kept.`, 'Delete');
           if (!ok) return;
-          await db.products.delete(p.id);
+          // Soft-delete: a hard delete here would never reach other devices,
+          // since sync.js can only tell them about a removal by pushing a
+          // tombstone row first. The local copy is hidden immediately
+          // (rebuildProductIndex filters `deleted`) and is only physically
+          // removed once pushTable() has actually synced the tombstone.
+          await db.products.update(p.id, { deleted: true, synced: 0 });
           await rebuildProductIndex();
           closeModal();
           renderProductsBody();
@@ -783,9 +855,9 @@
       if (!product) { toast('Pick a valid product from the list', 'error'); return; }
       const qty = parseInt(fd.get('qty'), 10);
       const unitCost = parseFloat(fd.get('unitCost'));
-      await db.products.update(product.id, { quantity: product.quantity + qty, costPrice: unitCost });
-      await db.purchases.add({ date: Date.now(), productId: product.id, quantity: qty, unitCost, supplier: fd.get('supplier') || '', invoice: fd.get('invoice') || '' });
-      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'in', quantity: qty, reason: 'Stock In', note: fd.get('invoice') || '' });
+      await db.products.update(product.id, { quantity: product.quantity + qty, costPrice: unitCost, synced: 0 });
+      await db.purchases.add({ date: Date.now(), productId: product.id, quantity: qty, unitCost, supplier: fd.get('supplier') || '', invoice: fd.get('invoice') || '', uuid: genUuid(), synced: 0 });
+      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'in', quantity: qty, reason: 'Stock In', note: fd.get('invoice') || '', uuid: genUuid(), synced: 0 });
       await rebuildProductIndex();
       toast(`+${qty} added to ${product.name}`);
       e.target.reset();
@@ -821,8 +893,8 @@
       if (!delta) { toast('Enter a non-zero quantity change', 'error'); return; }
       const newQty = product.quantity + delta;
       if (!S.settings.allowNegativeStock && newQty < 0) { toast('That would take stock negative (disallowed in Settings)', 'error'); return; }
-      await db.products.update(product.id, { quantity: newQty });
-      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'adjust', quantity: delta, reason, note: fd.get('note') || '' });
+      await db.products.update(product.id, { quantity: newQty, synced: 0 });
+      await db.stockMovements.add({ date: Date.now(), productId: product.id, type: 'adjust', quantity: delta, reason, note: fd.get('note') || '', uuid: genUuid(), synced: 0 });
       await rebuildProductIndex();
       toast(`Adjusted ${product.name} by ${delta > 0 ? '+' : ''}${delta}`);
       e.target.reset();
@@ -849,7 +921,7 @@
   /* ----- Suppliers / Customers ----- */
   async function renderPeopleTab(body, kind) {
     const table = kind === 'suppliers' ? db.suppliers : db.customers;
-    const list = await table.toArray();
+    const list = (await table.toArray()).filter((p) => !p.deleted);
     body.innerHTML = `
       <div class="btn-row" style="margin-bottom:10px"><button class="btn primary sm" id="add-person">+ Add ${kind === 'suppliers' ? 'Supplier' : 'Customer'}</button></div>
       <div id="people-list"></div>`;
@@ -902,7 +974,8 @@
         if (isSupplier) { data.tin = fd.get('tin').trim(); data.address = fd.get('address').trim(); }
         else { data.creditLimit = parseFloat(fd.get('creditLimit')) || 0; }
         const table = isSupplier ? db.suppliers : db.customers;
-        if (isEdit) await table.update(p.id, data); else await table.add(data);
+        if (isEdit) { data.synced = 0; await table.update(p.id, data); }
+        else { data.uuid = genUuid(); data.synced = 0; await table.add(data); }
         closeModal();
         renderProductsBody();
         toast('Saved');
@@ -911,7 +984,8 @@
         qs('#person-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete?', `Remove "${p.name}" from your ${isSupplier ? 'suppliers' : 'customers'} list.`, 'Delete');
           if (!ok) return;
-          await (isSupplier ? db.suppliers : db.customers).delete(p.id);
+          // Soft-delete (tombstone), same reasoning as product deletes above.
+          await (isSupplier ? db.suppliers : db.customers).update(p.id, { deleted: true, synced: 0 });
           closeModal(); renderProductsBody();
         };
       }
@@ -1069,10 +1143,10 @@
       if (!name) { toast('Customer name is required for a credit sale', 'error'); return; }
       const phone = (qs('#pos-cust-phone', el) || {}).value?.trim() || '';
       const due = (qs('#pos-cust-due', el) || {}).value || '';
-      let cust = (await db.customers.toArray()).find((c) => c.name.toLowerCase() === name.toLowerCase() && c.phone === phone);
-      if (!cust) { customerId = await db.customers.add({ name, phone, creditLimit: 0, balance: 0 }); }
+      let cust = (await db.customers.toArray()).find((c) => !c.deleted && c.name.toLowerCase() === name.toLowerCase() && c.phone === phone);
+      if (!cust) { customerId = await db.customers.add({ name, phone, creditLimit: 0, balance: 0, uuid: genUuid(), synced: 0 }); }
       else customerId = cust.id;
-      await db.customers.update(customerId, { balance: ((await db.customers.get(customerId)).balance || 0) + total, dueDate: due });
+      await db.customers.update(customerId, { balance: ((await db.customers.get(customerId)).balance || 0) + total, dueDate: due, synced: 0 });
       customerName = name;
     } else if (account.type === 'mobile_money' || account.type === 'bank') {
       payerRef = (qs('#pos-payer-ref', el) || {}).value?.trim() || '';
@@ -1092,13 +1166,14 @@
         date: Date.now(), subtotal, discount, total, profit,
         paymentAccountId: account.id, paymentAccountLabel: account.label,
         payerReference: payerRef, customerId, customerName,
+        uuid: genUuid(), synced: 0
       });
       for (const c of S.cart) {
-        await db.saleItems.add({ saleId, productId: c.productId, name: c.name, qty: c.qty, price: c.price, costAtSale: c.cost });
+        await db.saleItems.add({ saleId, productId: c.productId, name: c.name, qty: c.qty, price: c.price, costAtSale: c.cost, uuid: genUuid(), synced: 0 });
         const p = S.productIndex.find((x) => x.id === c.productId);
         const newQty = (p ? p.quantity : 0) - c.qty;
-        await db.products.update(c.productId, { quantity: newQty });
-        await db.stockMovements.add({ date: Date.now(), productId: c.productId, type: 'sale', quantity: -c.qty, reason: 'Sale', note: `Sale #${saleId}` });
+        await db.products.update(c.productId, { quantity: newQty, synced: 0 });
+        await db.stockMovements.add({ date: Date.now(), productId: c.productId, type: 'sale', quantity: -c.qty, reason: 'Sale', note: `Sale #${saleId}`, uuid: genUuid(), synced: 0 });
       }
       await rebuildProductIndex();
       printReceipt({ saleId, items: S.cart.slice(), subtotal, discount, total, account, payerRef, customerName });
@@ -1214,7 +1289,7 @@
     const sales = (await db.sales.where('date').between(from, to, true, true).toArray());
     const revenue = sales.reduce((s, x) => s + x.total, 0);
     const profit = sales.reduce((s, x) => s + (x.profit || 0), 0);
-    const products = S.productIndex.length ? S.productIndex : await db.products.toArray();
+    const products = S.productIndex.length ? S.productIndex : (await db.products.toArray()).filter((p) => !p.deleted);
     const stockCost = products.reduce((s, p) => s + p.costPrice * p.quantity, 0);
     const stockRetail = products.reduce((s, p) => s + p.sellingPrice * p.quantity, 0);
     const threshold = (p) => (p.minStock != null ? p.minStock : S.settings.lowStockDefault);
@@ -1331,6 +1406,9 @@
         <div class="section-title">Payment accounts</div>
         <div class="card" id="accounts-card"></div>
 
+        <div class="section-title">Cloud Sync</div>
+        <div class="card" id="sync-card">Loading…</div>
+
         <div class="section-title">Data</div>
         <div class="card">
           <p style="font-size:13px;color:var(--ink-muted);margin-bottom:12px">Back up your full database as a JSON file, or restore from a previous backup. Keep backups off-device (email, Drive, SD card).</p>
@@ -1362,6 +1440,7 @@
         toast('Shop info saved');
       });
       renderAccountsCard(qs('#accounts-card', el));
+      renderSyncCard(qs('#sync-card', el));
       qs('#backup-export', el).addEventListener('click', backupExport);
       qs('#backup-import', el).addEventListener('change', (e) => { if (e.target.files[0]) backupImport(e.target.files[0]); });
       qs('#reset-all', el).addEventListener('click', resetAllData);
@@ -1413,7 +1492,8 @@
         e.preventDefault();
         const fd = new FormData(e.target);
         const data = { label: fd.get('label').trim(), type: fd.get('type'), numberOrPhone: fd.get('numberOrPhone').trim() };
-        if (isEdit) await db.accounts.update(a.id, data); else await db.accounts.add(data);
+        if (isEdit) { data.synced = 0; await db.accounts.update(a.id, data); }
+        else { data.uuid = genUuid(); data.synced = 0; await db.accounts.add(data); }
         await refreshAccounts();
         closeModal();
         showView('settings');
@@ -1423,13 +1503,77 @@
         qs('#account-delete', modal).onclick = async () => {
           const ok = await confirmDialog('Delete account?', `Remove "${a.label}" from payment options.`, 'Delete');
           if (!ok) return;
-          await db.accounts.delete(a.id);
+          await db.accounts.update(a.id, { deleted: true, synced: 0 });
           await refreshAccounts();
           closeModal();
           showView('settings');
         };
       }
     });
+  }
+
+  /* ---------------------------------------------------------------------
+     Cloud Sync (Supabase) — sync.js and supabase-client.js implement the
+     whole push/pull engine, but nothing in this file ever called them, so
+     multi-device sync was dead code that never actually ran. This card is
+     the missing entry point: sign in/up, then hand off to
+     window.DuketSync.startAutoSync().
+     --------------------------------------------------------------------- */
+  async function renderSyncCard(box) {
+    if (!window.DuketAuth) { box.innerHTML = `<p style="font-size:13px;color:var(--ink-muted)">Cloud sync isn't available on this build.</p>`; return; }
+    const session = await window.DuketAuth.getSession();
+    if (session) {
+      box.innerHTML = `
+        <p style="font-size:13px;color:var(--ink-muted);margin-bottom:10px">Signed in as <b>${escapeHtml(session.user.email || '')}</b>. This device syncs automatically with your other devices while online.</p>
+        <div class="btn-row">
+          <button class="btn ghost sm" id="sync-now">🔄 Sync now</button>
+          <button class="btn danger sm" id="sync-signout">Sign out</button>
+        </div>`;
+      qs('#sync-now', box).addEventListener('click', async () => {
+        toast('Syncing…');
+        await window.DuketSync.syncNow();
+        await rebuildProductIndex();
+        await refreshAccounts();
+        toast('Sync complete');
+      });
+      qs('#sync-signout', box).addEventListener('click', async () => {
+        await window.DuketAuth.signOut();
+        toast('Signed out');
+        showView('settings');
+      });
+    } else {
+      box.innerHTML = `
+        <p style="font-size:13px;color:var(--ink-muted);margin-bottom:10px">Sign in to back up this shop to the cloud and keep multiple devices in sync.</p>
+        <form id="sync-form">
+          <div class="field"><label>Email</label><input name="email" type="email" required></div>
+          <div class="field"><label>Password</label><input name="password" type="password" required minlength="6"></div>
+          <div class="btn-row">
+            <button type="submit" class="btn primary sm">Sign in</button>
+            <button type="button" class="btn ghost sm" id="sync-signup">Create account</button>
+          </div>
+        </form>`;
+      const form = qs('#sync-form', box);
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const fd = new FormData(form);
+        const { error } = await window.DuketAuth.signIn(fd.get('email').trim(), fd.get('password'));
+        if (error) { toast(error.message, 'error'); return; }
+        toast('Signed in — syncing…');
+        window.DuketSync.startAutoSync();
+        showView('settings');
+      });
+      qs('#sync-signup', box).addEventListener('click', async () => {
+        const fd = new FormData(form);
+        const email = (fd.get('email') || '').trim();
+        const password = fd.get('password') || '';
+        if (!email || password.length < 6) { toast('Enter an email and a password (6+ characters)', 'error'); return; }
+        const { error } = await window.DuketAuth.signUp(email, password);
+        if (error) { toast(error.message, 'error'); return; }
+        toast('Account created — syncing…');
+        window.DuketSync.startAutoSync();
+        showView('settings');
+      });
+    }
   }
 
   async function backupExport() {
@@ -1468,6 +1612,7 @@
         if (data.accounts.length) await db.accounts.bulkAdd(data.accounts);
         if (data.settings.length) await db.settings.bulkAdd(data.settings);
       });
+      await backfillSyncFields(); // in case this backup predates uuid/synced fields
       await ensureDefaults();
       await rebuildProductIndex();
       toast('Backup restored');
@@ -1527,6 +1672,20 @@
     showView('dashboard');
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch((err) => console.warn('SW registration failed', err));
+    }
+    // Cloud sync: only kick off the auto-sync loop once we know a shop
+    // owner is actually signed in (startAutoSync() itself no-ops without a
+    // session, but there's no point running the 30s timer/online listener
+    // at all for the common signed-out, fully-local shop). onAuthChange
+    // also starts it the moment someone signs in from the Settings card,
+    // and stays subscribed for the rest of the session in case of a token
+    // refresh or a sign-in on a previously signed-out device.
+    if (window.DuketAuth && window.DuketSync) {
+      const session = await window.DuketAuth.getSession();
+      if (session) window.DuketSync.startAutoSync();
+      window.DuketAuth.onAuthChange((event, sess) => {
+        if (sess) window.DuketSync.startAutoSync();
+      });
     }
   }
 
