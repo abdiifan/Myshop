@@ -1755,7 +1755,7 @@
       qs('#sync-signout', box).addEventListener('click', async () => {
         await window.MyShopAuth.signOut();
         toast('Signed out');
-        showView('settings');
+        renderLockScreen();
       });
     } else {
       box.innerHTML = `
@@ -1852,57 +1852,99 @@
   }
 
   /* ---------------------------------------------------------------------
-     First launch — a device with no local shop yet must not silently
-     create a brand-new blank one until we've ruled out that this person
-     already has a shop in the cloud. Otherwise signing in on a second
-     device creates duplicate default accounts and can overwrite the real
-     shop's name/phone (see renderFirstLaunchChooser / attemptInitialSync).
+     Session gate — the whole app requires a signed-in account. `locked`
+     tracks whether the lock screen is the thing currently on screen, so
+     boot() and the reactive auth listener below agree on state and don't
+     fight each other or double-render. wireAuthReactivity() is set up
+     once (from boot()) and is what makes the app react live if the
+     session disappears mid-use — token expiry, another tab signing out,
+     etc. — not just re-check on next launch.
      --------------------------------------------------------------------- */
-  function renderFirstLaunchChooser() {
-    const app = qs('#app');
-    app.innerHTML = `
-      <div class="onboarding">
-        <div class="ic">🏪</div>
-        <h1>Welcome to My Shop</h1>
-        <p>Your offline inventory &amp; point-of-sale manager.</p>
-        <div style="display:flex;flex-direction:column;gap:10px;margin-top:22px">
-          <button class="btn primary block" id="choose-signin">I already use My Shop — Sign in</button>
-          <button class="btn block" id="choose-new">Set up a new shop</button>
-        </div>
-      </div>`;
-    qs('#choose-signin').onclick = renderFirstLaunchSignIn;
-    qs('#choose-new').onclick = async () => { await ensureDefaults(); renderOnboarding(); };
+  let locked = true;
+  let authWired = false;
+
+  function wireAuthReactivity() {
+    if (authWired || !window.MyShopAuth) return;
+    authWired = true;
+    window.MyShopAuth.onAuthChange((event, sess) => {
+      if (sess) {
+        if (window.MyShopSync) window.MyShopSync.startAutoSync();
+        // Only react by jumping into the app if we were sitting on the
+        // lock screen (fresh sign-in there). If we're already inside the
+        // app, boot()/attemptInitialSync already handled getting here —
+        // re-running them on every token refresh would be wasteful.
+        if (locked) { locked = false; attemptInitialSync(); }
+      } else if (!locked) {
+        // Session vanished while the app was in use (expired token,
+        // signed out from another tab, etc.) — lock immediately rather
+        // than waiting for the next launch.
+        renderLockScreen();
+      }
+    });
   }
 
-  function renderFirstLaunchSignIn() {
+  /* ---------------------------------------------------------------------
+     Lock screen — replaces the whole app whenever there's no active
+     session. This is the ONLY entry point into My Shop now: it used to
+     be possible to tap "Set up a new shop" here and go straight to
+     onboarding with zero account, which meant a device could create a
+     brand-new shop that was never tied to anyone and could never sync or
+     be recovered. Every shop now has to belong to a signed-in account
+     before it can be created or opened, so this screen only offers sign
+     in / create account — there is no offline escape hatch.
+     --------------------------------------------------------------------- */
+  function renderLockScreen() {
+    locked = true;
     const app = qs('#app');
     app.innerHTML = `
       <div class="onboarding">
-        <div class="ic">🏪</div>
-        <h1>Sign in</h1>
-        <p>Sign in with the account you already use for My Shop — we'll load your existing shop onto this device.</p>
-        <form id="first-signin-form" style="text-align:left">
+        <div class="ic">🔒</div>
+        <h1>Sign in to My Shop</h1>
+        <p>An account is required to use My Shop. Sign in if you already have one, or create one to set up a new shop.</p>
+        <form id="lock-form" style="text-align:left">
           <div class="field"><label>Email</label><input name="email" type="email" required></div>
-          <div class="field"><label>Password</label><input name="password" type="password" required></div>
-          <p id="signin-err" style="color:#c0392b;font-size:13px;display:none"></p>
-          <button class="btn primary block" type="submit">Sign in</button>
+          <div class="field"><label>Password</label><input name="password" type="password" required minlength="6"></div>
+          <p id="lock-err" style="color:#c0392b;font-size:13px;display:none"></p>
+          <div class="btn-row">
+            <button type="submit" class="btn primary block">Sign in</button>
+            <button type="button" class="btn block" id="lock-signup">Create account</button>
+          </div>
         </form>
-        <p style="margin-top:14px"><a href="#" id="back-to-chooser">← Back</a></p>
       </div>`;
-    qs('#back-to-chooser').addEventListener('click', (e) => { e.preventDefault(); renderFirstLaunchChooser(); });
-    qs('#first-signin-form').addEventListener('submit', async (e) => {
+    const form = qs('#lock-form');
+    const errEl = qs('#lock-err');
+    const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; };
+    const setBusy = (busy) => qsa('button', form).forEach((b) => { b.disabled = busy; });
+
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const fd = new FormData(e.target);
-      const btn = e.target.querySelector('button[type=submit]');
-      btn.disabled = true;
+      errEl.style.display = 'none';
+      setBusy(true);
+      const fd = new FormData(form);
       const { error } = await window.MyShopAuth.signIn(fd.get('email').trim(), fd.get('password'));
       if (error) {
-        btn.disabled = false;
-        const errEl = qs('#signin-err');
-        errEl.textContent = error.message || 'Sign in failed — check your email and password.';
-        errEl.style.display = 'block';
+        setBusy(false);
+        showErr(error.message || 'Sign in failed — check your email and password.');
         return;
       }
+      locked = false;
+      await attemptInitialSync();
+    });
+
+    qs('#lock-signup').addEventListener('click', async () => {
+      errEl.style.display = 'none';
+      const fd = new FormData(form);
+      const email = (fd.get('email') || '').trim();
+      const password = fd.get('password') || '';
+      if (!email || password.length < 6) { showErr('Enter an email and a password (6+ characters)'); return; }
+      setBusy(true);
+      const { error } = await window.MyShopAuth.signUp(email, password);
+      if (error) {
+        setBusy(false);
+        showErr(error.message || 'Could not create account.');
+        return;
+      }
+      locked = false;
       await attemptInitialSync();
     });
   }
@@ -1922,7 +1964,7 @@
     qs('#retry-sync').onclick = () => attemptInitialSync();
     qs('#cancel-signin').onclick = async () => {
       await window.MyShopAuth.signOut();
-      renderFirstLaunchChooser();
+      renderLockScreen();
     };
   }
 
@@ -1947,13 +1989,13 @@
 
     const shop = await db.settings.get('shop');
     if (shop && shop.onboarded) {
+      locked = false;
       await ensureDefaults();
       await rebuildProductIndex();
       renderShell();
       showView('dashboard');
       registerServiceWorker();
       window.MyShopSync.startAutoSync();
-      window.MyShopAuth.onAuthChange((event, sess) => { if (sess) window.MyShopSync.startAutoSync(); });
       return;
     }
 
@@ -1975,7 +2017,8 @@
   /* ---------------------------------------------------------------------
      Onboarding — creating a brand-new local (and, once signed in, remote)
      shop. Only ever reached once we've ruled out an existing shop already
-     belonging to this person (see attemptInitialSync / renderFirstLaunchChooser).
+     belonging to this person, and only once they're signed in (see
+     attemptInitialSync / renderLockScreen).
      --------------------------------------------------------------------- */
   function renderOnboarding() {
     const app = qs('#app');
@@ -2039,6 +2082,19 @@
      Boot
      --------------------------------------------------------------------- */
   async function boot() {
+    // Session check happens first, on every boot — not just the first
+    // launch. A device with a local shop already set up must NOT be
+    // allowed to open it without an active session, and a device with no
+    // local shop must NOT be allowed to create one without an account
+    // (see renderLockScreen). wireAuthReactivity() is also what makes the
+    // app react live if the session disappears mid-use, not just here.
+    if (window.MyShopAuth) {
+      wireAuthReactivity();
+      const session = await window.MyShopAuth.getSession();
+      if (!session) { renderLockScreen(); return; }
+      locked = false;
+    }
+
     const localShop = await db.settings.get('shop');
 
     if (localShop && localShop.onboarded) {
@@ -2051,26 +2107,21 @@
       renderShell();
       showView('dashboard');
       registerServiceWorker();
-      if (window.MyShopAuth && window.MyShopSync) {
-        const session = await window.MyShopAuth.getSession();
-        if (session) window.MyShopSync.startAutoSync();
-        window.MyShopAuth.onAuthChange((event, sess) => {
-          if (sess) window.MyShopSync.startAutoSync();
-        });
-      }
+      if (window.MyShopAuth && window.MyShopSync) window.MyShopSync.startAutoSync();
       return;
     }
 
-    // No local shop yet. Before creating one, find out whether this
-    // person already has a shop in the cloud — either because they're
-    // already signed in (session persisted from before), or because
-    // they're about to sign in from the first-launch chooser. Only once
-    // that's ruled out do we ever create local defaults or ask them to
-    // set up a brand-new shop (see attemptInitialSync / renderOnboarding).
+    // No local shop yet. If cloud sync is available, we already know
+    // above that there's an active session — so find out whether this
+    // account already has a shop in the cloud before creating anything
+    // local. Only once that's ruled out do we ever create local defaults
+    // or ask them to set up a brand-new shop (see attemptInitialSync /
+    // renderOnboarding). There is no offline path here anymore: without
+    // window.MyShopAuth, renderLockScreen would never have been reachable,
+    // so reaching this point always means we're either signed in or
+    // running a build with no cloud sync at all (handled below).
     if (window.MyShopAuth && window.MyShopSync) {
-      const session = await window.MyShopAuth.getSession();
-      if (session) { await attemptInitialSync(); return; }
-      renderFirstLaunchChooser();
+      await attemptInitialSync();
       return;
     }
 
