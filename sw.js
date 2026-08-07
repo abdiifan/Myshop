@@ -4,7 +4,7 @@
    Bump CACHE_VERSION whenever any precached file changes — this forces
    old clients to fetch the new files instead of serving stale ones.
    ========================================================================== */
-const CACHE_VERSION = 'duket-v2';
+const CACHE_VERSION = 'duket-v3'; // bumped: app.js/styles.css changed (sync fixes, Amharic CSV/print fonts) — old clients were stuck serving the stale cached copies since this wasn't bumped last deploy
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
