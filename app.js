@@ -1743,8 +1743,18 @@
         <p style="font-size:13px;color:var(--ink-muted);margin-bottom:10px">Signed in as <b>${escapeHtml(session.user.email || '')}</b>. This device syncs automatically with your other devices while online.</p>
         <div class="btn-row">
           <button class="btn ghost sm" id="sync-now">🔄 Sync now</button>
+          <button class="btn ghost sm" id="sync-changepw">🔑 Change password</button>
           <button class="btn danger sm" id="sync-signout">Sign out</button>
-        </div>`;
+        </div>
+        <form id="changepw-form" style="display:none;margin-top:12px">
+          <div class="field"><label>New password</label><input name="password" type="password" required minlength="6"></div>
+          <div class="field"><label>Confirm new password</label><input name="password2" type="password" required minlength="6"></div>
+          <p id="changepw-err" style="color:#c0392b;font-size:13px;display:none"></p>
+          <div class="btn-row">
+            <button type="submit" class="btn primary sm">Save</button>
+            <button type="button" class="btn ghost sm" id="changepw-cancel">Cancel</button>
+          </div>
+        </form>`;
       qs('#sync-now', box).addEventListener('click', async () => {
         toast('Syncing…');
         await window.MyShopSync.syncNow();
@@ -1756,6 +1766,27 @@
         await window.MyShopAuth.signOut();
         toast('Signed out');
         renderLockScreen();
+      });
+      const pwForm = qs('#changepw-form', box);
+      const pwErr = qs('#changepw-err', box);
+      qs('#sync-changepw', box).addEventListener('click', () => {
+        pwForm.style.display = pwForm.style.display === 'none' ? 'block' : 'none';
+      });
+      qs('#changepw-cancel', box).addEventListener('click', () => { pwForm.style.display = 'none'; pwForm.reset(); });
+      pwForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        pwErr.style.display = 'none';
+        const fd = new FormData(pwForm);
+        const password = fd.get('password') || '';
+        const password2 = fd.get('password2') || '';
+        if (password.length < 6) { pwErr.textContent = 'Password must be at least 6 characters.'; pwErr.style.display = 'block'; return; }
+        if (password !== password2) { pwErr.textContent = 'Passwords do not match.'; pwErr.style.display = 'block'; return; }
+        qsa('button', pwForm).forEach((b) => (b.disabled = true));
+        const { error } = await window.MyShopAuth.updatePassword(password);
+        qsa('button', pwForm).forEach((b) => (b.disabled = false));
+        if (error) { pwErr.textContent = error.message || 'Could not update password.'; pwErr.style.display = 'block'; return; }
+        pwForm.style.display = 'none'; pwForm.reset();
+        toast('Password updated');
       });
     } else {
       box.innerHTML = `
@@ -1867,6 +1898,13 @@
     if (authWired || !window.MyShopAuth) return;
     authWired = true;
     window.MyShopAuth.onAuthChange((event, sess) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        // User followed a "reset your password" email link — they now have
+        // a valid session, but we should make them set a new password
+        // rather than silently dropping them into their shop's data.
+        renderSetNewPasswordScreen();
+        return;
+      }
       if (sess) {
         if (window.MyShopSync) window.MyShopSync.startAutoSync();
         // Only react by jumping into the app if we were sitting on the
@@ -1905,16 +1943,31 @@
           <div class="field"><label>Email</label><input name="email" type="email" required></div>
           <div class="field"><label>Password</label><input name="password" type="password" required minlength="6"></div>
           <p id="lock-err" style="color:#c0392b;font-size:13px;display:none"></p>
+          <p id="lock-msg" style="color:var(--accent);font-size:13px;display:none"></p>
           <div class="btn-row">
             <button type="submit" class="btn primary block">Sign in</button>
             <button type="button" class="btn block" id="lock-signup">Create account</button>
           </div>
+          <button type="button" class="btn ghost sm block" id="lock-forgot" style="margin-top:10px">Forgot password?</button>
         </form>
       </div>`;
     const form = qs('#lock-form');
     const errEl = qs('#lock-err');
-    const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; };
+    const msgEl = qs('#lock-msg');
+    const showErr = (msg) => { msgEl.style.display = 'none'; errEl.textContent = msg; errEl.style.display = 'block'; };
+    const showMsg = (msg) => { errEl.style.display = 'none'; msgEl.textContent = msg; msgEl.style.display = 'block'; };
     const setBusy = (busy) => qsa('button', form).forEach((b) => { b.disabled = busy; });
+
+    qs('#lock-forgot').addEventListener('click', async () => {
+      errEl.style.display = 'none'; msgEl.style.display = 'none';
+      const email = (qs('input[name="email"]', form).value || '').trim();
+      if (!email) { showErr('Enter your email above first, then tap "Forgot password?".'); return; }
+      setBusy(true);
+      const { error } = await window.MyShopAuth.resetPasswordForEmail(email);
+      setBusy(false);
+      if (error) { showErr(error.message || 'Could not send reset email.'); return; }
+      showMsg(`Password reset link sent to ${email}. Check your inbox and follow the link to set a new password.`);
+    });
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -1944,6 +1997,48 @@
         showErr(error.message || 'Could not create account.');
         return;
       }
+      locked = false;
+      await attemptInitialSync();
+    });
+  }
+
+  /** Shown when the user arrives via a "reset your password" email link
+   *  (PASSWORD_RECOVERY auth event). They already have a valid session at
+   *  this point — this screen just makes them pick a new password before
+   *  going any further. */
+  function renderSetNewPasswordScreen() {
+    const app = qs('#app');
+    app.innerHTML = `
+      <div class="onboarding">
+        <div class="ic">🔑</div>
+        <h1>Set a new password</h1>
+        <p>Choose a new password for your account.</p>
+        <form id="newpw-form" style="text-align:left">
+          <div class="field"><label>New password</label><input name="password" type="password" required minlength="6" autofocus></div>
+          <div class="field"><label>Confirm new password</label><input name="password2" type="password" required minlength="6"></div>
+          <p id="newpw-err" style="color:#c0392b;font-size:13px;display:none"></p>
+          <button type="submit" class="btn primary block">Save new password</button>
+        </form>
+      </div>`;
+    const form = qs('#newpw-form');
+    const errEl = qs('#newpw-err');
+    const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; };
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errEl.style.display = 'none';
+      const fd = new FormData(form);
+      const password = fd.get('password') || '';
+      const password2 = fd.get('password2') || '';
+      if (password.length < 6) { showErr('Password must be at least 6 characters.'); return; }
+      if (password !== password2) { showErr('Passwords do not match.'); return; }
+      qsa('button', form).forEach((b) => (b.disabled = true));
+      const { error } = await window.MyShopAuth.updatePassword(password);
+      if (error) {
+        qsa('button', form).forEach((b) => (b.disabled = false));
+        showErr(error.message || 'Could not update password.');
+        return;
+      }
+      toast('Password updated');
       locked = false;
       await attemptInitialSync();
     });
