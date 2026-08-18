@@ -17,7 +17,11 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     persistSession: true,     // keeps the session in localStorage across app loads
     autoRefreshToken: true,
-    detectSessionInUrl: false // My Shop is a PWA, not doing OAuth redirect flows
+    // Password-reset links land back on this app with a recovery token in
+    // the URL, so this needs to be true to pick it up (fires the
+    // PASSWORD_RECOVERY auth event below). We're still not doing OAuth
+    // redirect flows, just this one email-link case.
+    detectSessionInUrl: true
   }
 });
 
@@ -36,6 +40,24 @@ export async function signIn(email, password) {
 
 export async function signOut() {
   return supabase.auth.signOut();
+}
+
+/** Sends the user a "reset your password" email. They land back on this
+ *  app URL with a recovery token, which fires the PASSWORD_RECOVERY event
+ *  in onAuthChange below so app.js can show a "set a new password" form. */
+export async function resetPasswordForEmail(email) {
+  const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin + window.location.pathname
+  });
+  return { data, error };
+}
+
+/** Sets a new password for the CURRENTLY signed-in user — used both for
+ *  the "reset link → new password" flow (PASSWORD_RECOVERY session) and
+ *  for a plain "change my password" option while already signed in. */
+export async function updatePassword(newPassword) {
+  const { data, error } = await supabase.auth.updateUser({ password: newPassword });
+  return { data, error };
 }
 
 /** Returns the logged-in user's session, or null if signed out.
@@ -93,5 +115,6 @@ export function onAuthChange(callback) {
 // app.js is a classic (non-module) script, so bridge these helpers onto
 // window for it to call. sync.js does the same for the sync functions.
 window.MyShopAuth = {
-  supabase, signUp, signIn, signOut, getSession, getShopId, onAuthChange
+  supabase, signUp, signIn, signOut, getSession, getShopId, onAuthChange,
+  resetPasswordForEmail, updatePassword
 };
