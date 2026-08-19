@@ -250,8 +250,23 @@ async function pullTable(cfg, shopId) {
       if (existing) await db[cfg.local].delete(existing.id);
     } else {
       const mapped = await cfg.fromRemote(remoteRow);
-      if (existing) await db[cfg.local].update(existing.id, mapped);
-      else await db[cfg.local].add(mapped);
+      if (existing) {
+        await db[cfg.local].update(existing.id, mapped);
+      } else {
+        // products' fromRemote deliberately omits `quantity` (see the NOTE
+        // above products' cfg) so that updating an EXISTING local row never
+        // clobbers its locally-derived quantity with a stale/racy remote
+        // figure. But that same omission is wrong for a row that doesn't
+        // exist locally yet (new device, or a product created on another
+        // device): db.add() would then insert it with quantity literally
+        // undefined, which shows as "undefined in stock" in the UI until
+        // (if ever) a stockMovements row for it happens to sync down too.
+        // Default it to 0 here — recomputeProductQuantities() below will
+        // immediately correct it from the ledger for any product touched
+        // by movements pulled in this same sync pass.
+        if (cfg.local === 'products' && mapped.quantity === undefined) mapped.quantity = 0;
+        await db[cfg.local].add(mapped);
+      }
     }
     if (remoteRow.updated_at > maxUpdated) maxUpdated = remoteRow.updated_at;
   }
