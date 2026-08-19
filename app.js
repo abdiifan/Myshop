@@ -965,12 +965,35 @@
           if (isEdit) {
             data.synced = 0; // mark dirty so this edit gets pushed on next sync
             await db.products.update(p.id, data);
+            // Keep the stockMovements ledger in sync with any manual quantity
+            // edit here. Without this, a direct quantity change on this form
+            // is invisible to the ledger, and sync.js's recomputeProductQuantities()
+            // (which trusts ONLY stockMovements as the source of truth after a
+            // sync pull) would later overwrite this product's quantity with a
+            // number that ignores this edit entirely.
+            const prevQty = p.quantity || 0;
+            const delta = data.quantity - prevQty;
+            if (delta !== 0) {
+              await db.stockMovements.add({ date: Date.now(), productId: p.id, type: 'adjust', quantity: delta, reason: 'Edited', note: 'Quantity changed via Edit product', uuid: genUuid(), synced: 0 });
+            }
             toast('Product updated');
           } else {
             data.createdAt = Date.now();
             data.uuid = genUuid();
             data.synced = 0;
-            await db.products.add(data);
+            const newId = await db.products.add(data);
+            // Same reasoning as above: a brand-new product's starting quantity
+            // is set directly on the product row, with nothing recorded in
+            // stockMovements. That's fine until a sync-triggered recompute
+            // happens for this product (e.g. after any later sale) — at that
+            // point recomputeProductQuantities() sums the ledger from scratch
+            // and, finding no record of this initial stock, replaces the
+            // correct quantity with just the sum of later movements (often
+            // negative after a sale). Recording it here as an 'initial'
+            // movement keeps the ledger and the cached quantity consistent.
+            if (data.quantity) {
+              await db.stockMovements.add({ date: Date.now(), productId: newId, type: 'initial', quantity: data.quantity, reason: 'Initial stock', note: '', uuid: genUuid(), synced: 0 });
+            }
             toast('Product added');
           }
           await rebuildProductIndex();
