@@ -875,18 +875,40 @@
         const sku = (r.sku || '').trim() || nextSku(r.category, r.brand);
         if (existingSkus.has(sku)) { skipped++; continue; }
         existingSkus.add(sku);
+        const qty = parseInt(r.quantity, 10) || 0;
         toAdd.push({
           sku, name: r.name || 'Unnamed', brand: r.brand || '', category: r.category || 'Other',
           costPrice: parseFloat(r.costPrice) || 0, sellingPrice: parseFloat(r.sellingPrice) || 0,
           wholesalePrice: parseFloat(r.wholesalePrice) || null,
-          quantity: parseInt(r.quantity, 10) || 0, minStock: parseInt(r.minStock, 10) || S.settings.lowStockDefault,
+          quantity: qty, minStock: parseInt(r.minStock, 10) || S.settings.lowStockDefault,
           compatibleModels: r.compatibleModels || '', color: r.color || '', supplier: r.supplier || '',
           barcode: r.barcode || '', notes: r.notes || '', createdAt: Date.now(),
           uuid: genUuid(), synced: 0
         });
         added++;
       }
-      if (toAdd.length) await db.products.bulkAdd(toAdd);
+      if (toAdd.length) {
+        // bulkAdd returns the new local ids in the same order as toAdd — needed
+        // so each product's starting quantity can be recorded in stockMovements.
+        // Without this, sync.js (which trusts ONLY stockMovements as the source
+        // of truth for quantity on other devices — see recomputeProductQuantities())
+        // has nothing to derive the imported quantity from, and any OTHER device
+        // pulling this product ends up stuck at "0 in stock" forever, even though
+        // this device correctly shows the imported count. Mirrors what the
+        // "Add product" flow already does for a single manually-added product.
+        const newIds = await db.products.bulkAdd(toAdd, { allKeys: true });
+        const movements = [];
+        toAdd.forEach((p, i) => {
+          if (p.quantity) {
+            movements.push({
+              date: Date.now(), productId: newIds[i], type: 'initial',
+              quantity: p.quantity, reason: 'Initial stock', note: 'Imported via CSV',
+              uuid: genUuid(), synced: 0
+            });
+          }
+        });
+        if (movements.length) await db.stockMovements.bulkAdd(movements);
+      }
       await rebuildProductIndex();
       renderProductsBody();
       const skippedMsg = skipped ? (S.lang === 'am' ? `፣ ${skipped} ተደጋጋሚ ኤስኬዩ ተዘልሏል` : `, skipped ${skipped} duplicate SKU(s)`) : '';
