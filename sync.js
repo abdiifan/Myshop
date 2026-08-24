@@ -364,8 +364,20 @@ let syncing = false;
 
 export async function syncNow() {
   if (syncing || !navigator.onLine) return;
-  const shopId = await getShopId();
-  if (!shopId) return; // not signed in yet
+  let shopId;
+  try {
+    shopId = await getShopId();
+  } catch (err) {
+    // getShopId() throws on a genuine lookup failure (see supabase-client.js) —
+    // this call site (background auto-sync, unattended) just logs and skips
+    // this pass rather than crashing the interval/online-listener forever.
+    // attemptInitialSync() in app.js does its OWN direct getShopId() check
+    // first specifically so it does NOT swallow this the same way, since
+    // silently treating it as "no shop" there is what caused this bug.
+    console.warn('[sync] could not resolve shop this pass, will retry later', err.message);
+    return;
+  }
+  if (!shopId) return; // not signed in, or genuinely no shop yet for this account
   syncing = true;
   try {
     await syncShopSettings(shopId);
