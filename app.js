@@ -2112,6 +2112,23 @@
 
     if (!navigator.onLine) { renderAwaitingConnection(); return; }
 
+    // Check shop membership DIRECTLY and let a real failure THROW here,
+    // rather than only going through syncNow() (which deliberately swallows
+    // this same error for background auto-sync — see sync.js). This is the
+    // one call site that must never confuse "couldn't check" with
+    // "genuinely no shop": doing so is what used to let a second device
+    // silently re-onboard as a brand-new, disconnected shop whenever the
+    // membership lookup failed (e.g. an RLS problem on the server), instead
+    // of showing an error and letting the person retry.
+    let shopId;
+    try {
+      shopId = await window.MyShopAuth.getShopId({ forceRefresh: true });
+    } catch (err) {
+      console.error('Could not verify shop membership', err);
+      renderSyncError(err.message);
+      return;
+    }
+
     try {
       await window.MyShopSync.syncNow();
     } catch (err) {
@@ -2130,11 +2147,44 @@
       return;
     }
 
-    // Signed in, but this account has no existing shop on the server —
-    // genuine first-time setup. This device becomes the source of truth,
+    if (shopId) {
+      // This account IS a member of an existing shop, but its data hasn't
+      // finished pulling down onto this device yet (first sync race, slow
+      // connection, etc). Do NOT fall through to onboarding — that would
+      // create a second, conflicting local shop with the same email. Let
+      // the person retry instead of silently starting fresh.
+      renderSyncError('Your account is linked to an existing shop, but its data hasn\u2019t finished loading onto this device yet.');
+      return;
+    }
+
+    // Signed in, and genuinely no shop_members row at all for this account —
+    // real first-time setup. This device becomes the source of truth,
     // so it's correct to create local defaults and push them up.
     await ensureDefaults();
     renderOnboarding();
+  }
+
+  /** Shown when we can't safely tell whether this account already has a
+   *  shop (membership lookup failed) or the existing shop's data hasn't
+   *  synced down yet. Never falls through to onboarding on its own — the
+   *  person must explicitly retry, or sign out. */
+  function renderSyncError(message) {
+    const app = qs('#app');
+    app.innerHTML = `
+      <div class="empty" style="padding-top:28vh">
+        <div class="ic">⚠️</div>
+        <h3>Couldn't load your shop</h3>
+        <p style="max-width:320px;margin:0 auto">${escapeHtml(message || 'Something went wrong while checking your account.')}</p>
+        <div style="margin-top:16px;display:flex;gap:8px;justify-content:center">
+          <button class="btn primary" id="retry-sync-err">Retry</button>
+          <button class="btn" id="signout-sync-err">Sign out</button>
+        </div>
+      </div>`;
+    qs('#retry-sync-err').onclick = () => attemptInitialSync();
+    qs('#signout-sync-err').onclick = async () => {
+      await window.MyShopAuth.signOut();
+      renderLockScreen();
+    };
   }
 
   function registerServiceWorker() {
