@@ -4,7 +4,7 @@
    Bump CACHE_VERSION whenever any precached file changes — this forces
    old clients to fetch the new files instead of serving stale ones.
    ========================================================================== */
-const CACHE_VERSION = 'myshop-v4'; // bumped: renamed all "Duket" branding/identifiers to "My Shop" across app.js/styles.css/index.html/sync.js — old clients need this bump or they'll keep serving the stale pre-rename files
+const CACHE_VERSION = 'myshop-v5'; // bumped: fixed importProductsCSV() in app.js to write a matching stockMovements entry for imported quantities — old clients were still serving the pre-fix app.js from cache, which silently masked the fix (and any manual quantity edits made under the stale code never created the ledger row needed for sync)
 const SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
