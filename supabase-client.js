@@ -86,13 +86,30 @@ export async function getShopId({ forceRefresh = false } = {}) {
 
   if (!navigator.onLine) return cached || null;
 
+  // IMPORTANT: use maybeSingle(), not single(). single() errors both when
+  // the row genuinely doesn't exist AND when something else goes wrong
+  // (e.g. an RLS policy silently blocking the read), which used to make
+  // "this account really has no shop yet" indistinguishable from "the
+  // query broke" — both collapsed into this function returning null,
+  // which is exactly how a second device could silently treat an existing
+  // shop as brand-new and re-onboard with blank data instead of pulling
+  // the real thing.
+  //
+  // Now: a real query error is THROWN (never silently swallowed here), and
+  // only a genuinely empty result (no error, no row) returns null. Callers
+  // that need to tell "definitely no shop" apart from "couldn't check
+  // right now" — see attemptInitialSync() in app.js — depend on this.
   const { data, error } = await supabase
     .from('shop_members')
     .select('shop_id')
     .eq('user_id', session.user.id)
-    .single();
+    .maybeSingle();
 
-  if (error || !data) return null;
+  if (error) {
+    throw new Error(`Could not verify shop membership: ${error.message}`);
+  }
+  if (!data) return null; // genuinely not linked to any shop yet
+
   _cachedShopId = data.shop_id;
   localStorage.setItem('myshop:shopId', data.shop_id);
   return data.shop_id;
