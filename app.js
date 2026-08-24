@@ -60,6 +60,27 @@
   const startOfDay = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
   const daysAgo = (n) => { const x = startOfDay(new Date()); x.setDate(x.getDate() - n); return x; };
 
+  /** A short, stable-per-browser label ("Android-x7q2") for the audit log —
+   *  not a precise device fingerprint, just enough for a person reading the
+   *  wipe log to recognize "oh, that was my phone" vs "that was the till".
+   *  Generated once and cached in localStorage, so it stays the same for
+   *  this browser/device across reloads, but differs across browsers/devices
+   *  (each has its own localStorage, same as the rest of this app's data). */
+  function getDeviceLabel() {
+    let label = localStorage.getItem('myshop:deviceLabel');
+    if (label) return label;
+    const ua = navigator.userAgent || '';
+    let platform = 'Device';
+    if (/Android/i.test(ua)) platform = 'Android';
+    else if (/iPhone|iPad|iPod/i.test(ua)) platform = 'iOS';
+    else if (/Windows/i.test(ua)) platform = 'Windows';
+    else if (/Macintosh/i.test(ua)) platform = 'Mac';
+    else if (/Linux/i.test(ua)) platform = 'Linux';
+    label = `${platform}-${Math.random().toString(36).slice(2, 6)}`;
+    localStorage.setItem('myshop:deviceLabel', label);
+    return label;
+  }
+
   function toast(msg, type) {
     // Call sites mostly pass literal English strings, which t() translates
     // directly; sites with interpolated values build their own translated
@@ -219,7 +240,7 @@
       'Cloud Sync': 'ደመና ማመሳሰል', 'Data': 'ውሂብ',
       'Back up your full database as a JSON file, or restore from a previous backup. Keep backups off-device (email, Drive, SD card).': 'ሙሉ ውሂብዎን እንደ JSON ፋይል ምትኬ ያስቀምጡ፣ ወይም ካለፈ ምትኬ ይመልሱ። ምትኬዎችን ከመሣሪያ ውጭ ያስቀምጡ (ኢሜይል፣ Drive፣ ኤስዲ ካርድ)።',
       '⬇ Export backup (JSON)': '⬇ ምትኬ አውጣ (JSON)', '⬆ Restore backup': '⬆ ምትኬ መልስ',
-      '⚠ Reset all data': '⚠ ሁሉንም ውሂብ አድስ', 'Appearance': 'መልክ', '☀️ Light': '☀️ ብሩህ', '🌙 Dark': '🌙 ጨለማ',
+      '⚠ Reset all data': '⚠ ሁሉንም ውሂብ አድስ', '⚠ Reset this device': '⚠ ይህን መሣሪያ ዳግም አስጀምር', 'Appearance': 'መልክ', '☀️ Light': '☀️ ብሩህ', '🌙 Dark': '🌙 ጨለማ',
       'Language': 'ቋንቋ', 'English': 'እንግሊዝኛ', 'Amharic': 'አማርኛ',
       'My Shop v1.0 · All data stored on this device': 'My Shop v1.0 · ሁሉም ውሂብ በዚህ መሣሪያ ላይ ይቀመጣል',
       "Cloud sync isn't available on this build.": 'ደመና ማመሳሰል በዚህ ስሪት ውስጥ አይገኝም።',
@@ -262,6 +283,27 @@
       'Erase everything': 'ሁሉንም ደምስስ', 'Are you absolutely sure?': 'እርግጠኛ ነዎት?',
       'Type nothing — just confirm again to permanently erase all shop data.': 'ምንም አይተይቡ — ሁሉንም የሱቅ ውሂብ በቋሚነት ለማጥፋት እንደገና ያረጋግጡ።',
       'Yes, erase everything': 'አዎ፣ ሁሉንም ደምስስ', 'All data reset': 'ሁሉም ውሂብ ዳግም ተስተካክሏል',
+      // Reset this device (cloud-sync build)
+      'Reset this device?': 'ይህ መሣሪያ ዳግም ይጀመር?',
+      'This clears the local copy of your shop data on THIS device only and re-downloads it fresh from the cloud. Other devices signed into this shop are not affected.': 'ይህ በዚህ መሣሪያ ላይ ብቻ ያለውን የሱቅ ውሂብ የአካባቢ ቅጂ ያጸዳል እና ከደመናው በድጋሚ ያወርደዋል። ወደዚህ ሱቅ የገቡ ሌሎች መሣሪያዎች አይነኩም።',
+      'Erase and re-download': 'አጽዳ እና በድጋሚ አውርድ',
+      'Type nothing — just confirm again to reset this device.': 'ምንም አይተይቡ — ይህን መሣሪያ ዳግም ለማስጀመር እንደገና ያረጋግጡ።',
+      'Yes, reset this device': 'አዎ፣ ይህን መሣሪያ ዳግም አስጀምር',
+      'Resetting device — re-downloading your shop…': 'መሣሪያውን በማስጀመር ላይ — ሱቅዎን በድጋሚ በማውረድ ላይ…',
+      // Wipe shop everywhere (advanced)
+      'Advanced — deletes data in the cloud for every device, not just this one.': 'የላቀ — በደመናው ውስጥ ላሉ ሁሉም መሣሪያዎች ውሂብ ይሰርዛል፣ ለዚህ መሣሪያ ብቻ አይደለም።',
+      'Wipe shop data everywhere': 'የሱቅ ውሂብን በሁሉም ቦታ አጥፋ',
+      "Cloud sync isn't available on this build — there's no cloud copy to wipe.": 'ደመና ማመሳሰል በዚህ ስሪት ውስጥ አይገኝም — የሚጠፋ የደመና ቅጂ የለም።',
+      'You need to be online to wipe shop data from the cloud.': 'ከደመናው ላይ የሱቅ ውሂብን ለማጥፋት በመስመር ላይ መሆን ያስፈልግዎታል።',
+      'Could not verify your shop — try again.': 'ሱቅዎን ማረጋገጥ አልተቻለም — እንደገና ይሞክሩ።',
+      'No shop found for this account.': 'ለዚህ መለያ ምንም ሱቅ አልተገኘም።',
+      'Wipe this shop everywhere?': 'ይህ ሱቅ በሁሉም ቦታ ይጥፋ?',
+      'I understand, continue': 'ገብቶኛል፣ ቀጥል',
+      'Confirm by typing the shop name': 'የሱቅ ስም በመተየብ ያረጋግጡ',
+      'Wipe everywhere': 'በሁሉም ቦታ አጥፋ',
+      'Shop name did not match — nothing was deleted.': 'የሱቅ ስም አልገጠመም — ምንም አልተሰረዘም።',
+      'Wiping shop data…': 'የሱቅ ውሂብ በማጥፋት ላይ…',
+      'Shop last wiped everywhere:': 'ሱቅ በሁሉም ቦታ ለመጨረሻ ጊዜ የተጠፋው:', 'This device last reset:': 'ይህ መሣሪያ ለመጨረሻ ጊዜ ዳግም የተጀመረው:', 'by': 'በ',
       'Missing table:': 'የጎደለ ሠንጠረዥ:', 'Unnamed': 'ስም-አልባ', 'Unknown': 'ያልታወቀ', 'Unknown product': 'ያልታወቀ ምርት',
       'Enter a non-zero quantity change': 'ዜሮ ያልሆነ የብዛት ለውጥ ያስገቡ',
       'That would take stock negative (disallowed in Settings)': 'ይህ ክምችቱን ወደ አሉታዊ ይወስደዋል (በማስተካከያ ውስጥ አይፈቀድም)',
@@ -1678,7 +1720,12 @@
             <button class="btn ghost" id="backup-export">${t('⬇ Export backup (JSON)')}</button>
             <label class="btn ghost" style="cursor:pointer">${t('⬆ Restore backup')}<input type="file" id="backup-import" accept="application/json" style="display:none"></label>
           </div>
-          <button class="btn danger block" style="margin-top:14px" id="reset-all">${t('⚠ Reset all data')}</button>
+          <button class="btn danger block" style="margin-top:14px" id="reset-all">${window.MyShopAuth && window.MyShopSync ? t('⚠ Reset this device') : t('⚠ Reset all data')}</button>
+          ${window.MyShopAuth && window.MyShopSync ? `
+          <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)">
+            <p style="font-size:12px;color:var(--ink-faint);margin-bottom:8px">${t('Advanced — deletes data in the cloud for every device, not just this one.')}</p>
+            <button class="btn ghost sm" id="wipe-everywhere" style="color:#c0392b">${t('Wipe shop data everywhere')}</button>
+          </div>` : ''}
         </div>
 
         <div class="section-title">${t('Appearance')}</div>
@@ -1712,6 +1759,8 @@
       qs('#backup-export', el).addEventListener('click', backupExport);
       qs('#backup-import', el).addEventListener('change', (e) => { if (e.target.files[0]) backupImport(e.target.files[0]); });
       qs('#reset-all', el).addEventListener('click', resetAllData);
+      const wipeBtn = qs('#wipe-everywhere', el);
+      if (wipeBtn) wipeBtn.addEventListener('click', wipeShopEverywhere);
       qsa('[data-theme-opt]', el).forEach((b) => b.addEventListener('click', () => {
         if (b.dataset.themeOpt !== S.theme) toggleTheme();
         showView('settings');
@@ -1797,6 +1846,12 @@
     if (!window.MyShopAuth) { box.innerHTML = `<p style="font-size:13px;color:var(--ink-muted)">Cloud sync isn't available on this build.</p>`; return; }
     const session = await window.MyShopAuth.getSession();
     if (session) {
+      const deviceResetAt = localStorage.getItem('myshop:lastDeviceReset');
+      const shopWipeAt = S.settings && S.settings.lastWipeAt;
+      const shopWipeBy = S.settings && S.settings.lastWipeByDevice;
+      const logLines = [];
+      if (deviceResetAt) logLines.push(`${t('This device last reset:')} ${fmtDateTime(deviceResetAt)}`);
+      if (shopWipeAt) logLines.push(`${t('Shop last wiped everywhere:')} ${fmtDateTime(shopWipeAt)}${shopWipeBy ? ` (${t('by')} ${escapeHtml(shopWipeBy)})` : ''}`);
       box.innerHTML = `
         <p style="font-size:13px;color:var(--ink-muted);margin-bottom:10px">Signed in as <b>${escapeHtml(session.user.email || '')}</b>. This device syncs automatically with your other devices while online.</p>
         <div class="btn-row">
@@ -1804,6 +1859,7 @@
           <button class="btn ghost sm" id="sync-changepw">🔑 Change password</button>
           <button class="btn danger sm" id="sync-signout">Sign out</button>
         </div>
+        ${logLines.length ? `<div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">${logLines.map((l) => `<p style="font-size:11.5px;color:var(--ink-faint);margin:2px 0">${l}</p>`).join('')}</div>` : ''}
         <form id="changepw-form" style="display:none;margin-top:12px">
           <div class="field"><label>New password</label><input name="password" type="password" required minlength="6"></div>
           <div class="field"><label>Confirm new password</label><input name="password2" type="password" required minlength="6"></div>
@@ -1929,11 +1985,44 @@
   }
 
   async function resetAllData() {
-    const ok = await confirmDialog('Reset ALL data?', 'This permanently deletes every product, sale, and setting on this device. This cannot be undone.', 'Erase everything');
+    // This only ever clears THIS device's local cache — it never touches
+    // Supabase. With cloud sync on, that's fine (the real data lives in
+    // the cloud and this device just re-downloads it below), but it must
+    // be crystal clear in the copy that other devices are untouched.
+    const cloudSync = !!(window.MyShopAuth && window.MyShopSync);
+    const desc = cloudSync
+      ? 'This clears the local copy of your shop data on THIS device only and re-downloads it fresh from the cloud. Other devices signed into this shop are not affected.'
+      : 'This permanently deletes every product, sale, and setting on this device. This cannot be undone.';
+    const ok = await confirmDialog('Reset this device?', desc, 'Erase and re-download');
     if (!ok) return;
-    const ok2 = await confirmDialog('Are you absolutely sure?', 'Type nothing — just confirm again to permanently erase all shop data.', 'Yes, erase everything');
+    const ok2 = await confirmDialog('Are you absolutely sure?', 'Type nothing — just confirm again to reset this device.', cloudSync ? 'Yes, reset this device' : 'Yes, erase everything');
     if (!ok2) return;
+
     await db.transaction('rw', db.tables, async () => { for (const t of db.tables) await t.clear(); });
+
+    if (cloudSync) {
+      // Clear this device's sync watermarks too, or pullTable() would only
+      // ask Supabase for rows updated after the OLD watermark — since the
+      // real data in the cloud hasn't changed, nothing would come back and
+      // this device would be left permanently empty instead of re-syncing.
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith('myshop:lastSync:'))
+        .forEach((k) => localStorage.removeItem(k));
+      // Do NOT call ensureDefaults() here: it would immediately create a
+      // blank shop + 5 fresh default accounts (new uuids, synced: 0) on
+      // this device, which the next push would upsert into Supabase as
+      // DUPLICATES of the shop's real accounts. attemptInitialSync() re-runs
+      // the same safe "pull the real shop down before creating anything
+      // local" flow used on a brand-new device login, so this device ends
+      // up back in its normal synced state instead of a half-empty one.
+      toast('Resetting device — re-downloading your shop…');
+      localStorage.setItem('myshop:lastDeviceReset', new Date().toISOString());
+      await attemptInitialSync();
+      return;
+    }
+
+    // No cloud sync in this build — the local copy really is the only
+    // copy, so the old fully-local behavior is correct here.
     await ensureDefaults();
     await rebuildProductIndex();
     toast('All data reset');
@@ -2215,6 +2304,141 @@
         .then(setupUpdateFlow)
         .catch((err) => console.warn('SW registration failed', err));
     }
+  }
+
+  /** Like confirmDialog, but requires the person to type `mustMatch`
+   *  exactly before the confirm button is enabled. Used for the shop-wide
+   *  wipe below — a plain Yes/No tap is too easy to hit by accident for
+   *  something this destructive. Resolves true only on an exact match. */
+  function promptTextDialog(title, body, mustMatch, okLabel) {
+    return new Promise((resolve) => {
+      openModal(`
+        <div class="modal-head"><h3>${escapeHtml(t(title))}</h3>
+          <button class="modal-close" data-close>✕</button></div>
+        <p style="color:var(--ink-muted);font-size:14px;line-height:1.5;margin-bottom:14px">${escapeHtml(t(body))}</p>
+        <div class="field"><input type="text" id="prompt-input" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+        <div class="btn-row" style="margin-top:14px">
+          <button class="btn ghost block" data-cancel>${t('Cancel')}</button>
+          <button class="btn danger block" data-ok disabled>${escapeHtml(t(okLabel || 'Confirm'))}</button>
+        </div>`, (modal) => {
+        const input = qs('#prompt-input', modal);
+        const okBtn = qs('[data-ok]', modal);
+        input.addEventListener('input', () => { okBtn.disabled = input.value !== mustMatch; });
+        input.focus();
+        qs('[data-close]', modal).onclick = () => { closeModal(); resolve(false); };
+        qs('[data-cancel]', modal).onclick = () => { closeModal(); resolve(false); };
+        okBtn.onclick = () => { closeModal(); resolve(input.value === mustMatch); };
+      });
+    });
+  }
+
+  /** Wipes this shop's business data (products, sales, purchases, stock
+   *  movements, customers, suppliers, payment accounts) EVERYWHERE — the
+   *  cloud copy in Supabase, not just this device — then re-syncs this
+   *  device back to the now-empty state. This is deliberately separate
+   *  from resetAllData()/"Reset this device", which only ever touches the
+   *  local cache and leaves the cloud (and every other device) untouched.
+   *
+   *  Deletable tables (accounts/suppliers/customers/products) are soft-
+   *  deleted (tombstoned) so other devices' normal pull-sync picks up the
+   *  removal automatically, same as any other delete in this app.
+   *
+   *  Sales/sale items/purchases/stock movements have no delete UI or
+   *  tombstone support anywhere else in this app (they're meant to be an
+   *  immutable ledger) — so wiping them here is a genuine hard DELETE.
+   *  A hard delete leaves no trace for other devices' timestamp-based pull
+   *  to detect (see the NOTE on hard deletes in sync.js), so this alone
+   *  will NOT clear those tables on other devices — they need to each run
+   *  "Reset this device" afterward too. The confirmation dialog and the
+   *  follow-up notice both say this explicitly.
+   *
+   *  The shop profile itself (name/address/phone/tin in `settings`) is
+   *  deliberately left alone — this wipes business records, not the shop's
+   *  identity. */
+  async function wipeShopEverywhere() {
+    if (!(window.MyShopAuth && window.MyShopSync)) {
+      toast("Cloud sync isn't available on this build — there's no cloud copy to wipe.", 'error');
+      return;
+    }
+    if (!navigator.onLine) {
+      toast('You need to be online to wipe shop data from the cloud.', 'error');
+      return;
+    }
+    let shopId;
+    try {
+      shopId = await window.MyShopAuth.getShopId({ forceRefresh: true });
+    } catch (err) {
+      toast('Could not verify your shop — try again.', 'error');
+      return;
+    }
+    if (!shopId) { toast('No shop found for this account.', 'error'); return; }
+
+    const shopName = (S.settings && S.settings.name && S.settings.name.trim()) || '(unnamed shop)';
+
+    const ok = await confirmDialog(
+      'Wipe this shop everywhere?',
+      `This permanently deletes every product, sale, purchase, stock movement, customer, supplier, and payment account for "${shopName}" — in the cloud, which means EVERY device signed into this shop loses this data, not just this one. Your shop profile (name, address, phone, TIN) is kept. This cannot be undone.`,
+      'I understand, continue'
+    );
+    if (!ok) return;
+
+    const typedOk = await promptTextDialog(
+      'Confirm by typing the shop name',
+      `Type "${shopName}" exactly to confirm the wipe.`,
+      shopName,
+      'Wipe everywhere'
+    );
+    if (!typedOk) { toast('Shop name did not match — nothing was deleted.', 'error'); return; }
+
+    toast('Wiping shop data…');
+    const supabase = window.MyShopAuth.supabase;
+
+    const TOMBSTONE_TABLES = ['accounts', 'suppliers', 'customers', 'products'];
+    for (const table of TOMBSTONE_TABLES) {
+      const { error } = await supabase.from(table).update({ deleted: true }).eq('shop_id', shopId);
+      if (error) console.warn(`[wipe] tombstone ${table} failed`, error.message);
+    }
+
+    // Order matters for FK constraints: sale_items before sales, and
+    // stock_movements/purchases reference products but not each other.
+    const HARD_DELETE_TABLES = ['sale_items', 'sales', 'purchases', 'stock_movements'];
+    for (const table of HARD_DELETE_TABLES) {
+      const { error } = await supabase.from(table).delete().eq('shop_id', shopId);
+      if (error) console.warn(`[wipe] delete ${table} failed`, error.message);
+    }
+
+    // Record who wiped and when, directly on the shops row, so every device
+    // can display it (see the extra unconditional read in
+    // sync.js's syncShopSettings()). Deliberately NOT part of the normal
+    // settings push, which lists its columns explicitly and so can never
+    // clobber this — only this function ever writes these two columns.
+    const deviceLabel = getDeviceLabel();
+    const wipedAtIso = new Date().toISOString();
+    const { error: logErr } = await supabase.from('shops')
+      .update({ last_wipe_at: wipedAtIso, last_wipe_by_device: deviceLabel })
+      .eq('id', shopId);
+    if (logErr) console.warn('[wipe] could not record wipe log', logErr.message);
+
+    // Bring THIS device back in line the same way "Reset this device" does
+    // — clear the local cache and sync watermarks, keep the settings row,
+    // then re-sync (which will just come back empty, since the cloud copy
+    // is now empty too).
+    await db.transaction('rw', db.tables, async () => {
+      for (const table of db.tables) {
+        if (table.name === 'settings') continue;
+        await table.clear();
+      }
+    });
+    Object.keys(localStorage).filter((k) => k.startsWith('myshop:lastSync:')).forEach((k) => localStorage.removeItem(k));
+    localStorage.setItem('myshop:lastDeviceReset', wipedAtIso);
+
+    await attemptInitialSync();
+
+    // Hard-deleted tables can't self-propagate to other devices (see the
+    // function comment above) — make sure that's not a silent gap.
+    setTimeout(() => {
+      alert('Shop data wiped from the cloud. On every OTHER device signed into this shop, open Settings and tap "Reset this device" too — otherwise they\u2019ll keep showing the old sales/purchase/stock history that was just deleted.');
+    }, 400);
   }
 
   /* ---------------------------------------------------------------------
